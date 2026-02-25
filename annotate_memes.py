@@ -63,13 +63,34 @@ def find_next_with_image(df, start_idx: int):
     return None
 
 
+def find_next_existing_image_idx(df, start_idx: int):
+    for j in range(start_idx, len(df)):
+        key = str(df.iloc[j]["key"])
+        if find_image_path(IMG_DIR, key):
+            return j
+    return None
+
+
+def find_prev_existing_image_idx(df, start_idx: int):
+    for j in range(start_idx, -1, -1):
+        key = str(df.iloc[j]["key"])
+        if find_image_path(IMG_DIR, key):
+            return j
+    return None
+
+
+def first_unlabeled_with_image_idx(df):
+    idx = find_next_with_image(df, 0)
+    return idx if idx is not None else 0
+
+
 # -----------------------
 # App state
 # -----------------------
 if "df" not in st.session_state:
     st.session_state.df = load_df()
 if "i" not in st.session_state:
-    st.session_state.i = first_unlabeled_idx(st.session_state.df)
+    st.session_state.i = first_unlabeled_with_image_idx(st.session_state.df)
 
 df = st.session_state.df
 i = st.session_state.i
@@ -78,17 +99,18 @@ i = st.session_state.i
 i = max(0, min(i, len(df) - 1))
 st.session_state.i = i
 
-# auto-skip rows with missing images (no metadata saved)
-next_i = find_next_with_image(df, i)
-if next_i is not None and next_i != i:
-    st.session_state.i = next_i
-    st.info("Skipped rows with missing images.")
-    st.rerun()
-
 row = df.iloc[i]
 key = str(row["key"])
 
 img_path = find_image_path(IMG_DIR, key)
+
+# if current row has no image, automatically move forward to the next row with image
+if img_path is None:
+    next_i = find_next_existing_image_idx(df, i + 1)
+    if next_i is not None:
+        st.session_state.i = next_i
+        st.info("Current image not found. Moved to next available image.")
+        st.rerun()
 
 # -----------------------
 # UI
@@ -171,26 +193,24 @@ nav1, nav2, nav3, nav4 = st.columns([1, 1, 1, 2])
 
 with nav1:
     if st.button("⬅ Prev", use_container_width=True):
-        st.session_state.i = max(0, i - 1)
+        target = find_prev_existing_image_idx(df, i - 1)
+        st.session_state.i = target if target is not None else i
         st.rerun()
 
 with nav2:
     if st.button("Next ➡", use_container_width=True):
-        st.session_state.i = min(len(df) - 1, i + 1)
+        target = find_next_existing_image_idx(df, i + 1)
+        st.session_state.i = target if target is not None else i
         st.rerun()
 
 with nav3:
     if st.button("Next Unlabeled", use_container_width=True):
-        # jump to next row where either label is missing
-        mask = df["is_correct_text"].isna() & df["is_correct_img"].isna()
-        idxs = df.index[mask].tolist()
-        target = 0
-        for idx in idxs:
-            key_at_idx = str(df.iloc[idx]["key"])
-            # only jump to rows that have the image available
-            if find_image_path(IMG_DIR, key_at_idx):
-                target = idx
-                break
+        # jump to next BOTH-NaN row with an available image, searching forward then wrapping
+        target = find_next_with_image(df, i + 1)
+        if target is None:
+            target = find_next_with_image(df, 0)
+        if target is None:
+            target = i
         st.session_state.i = target
         st.rerun()
 

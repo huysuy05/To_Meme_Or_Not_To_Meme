@@ -14,3 +14,4 @@ Reddit2024_nolabel
 venv
 data/template_cluster_mapping.csv
 data/missing_images_from_merged.csv
+__pycache__/

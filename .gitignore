@@ -15,3 +15,8 @@ venv
 data/template_cluster_mapping.csv
 data/missing_images_from_merged.csv
 __pycache__/
+*/__init__.py
+SEED/discrepancies.txt
+SEED/view_newly_assigned_images.py
+SEED/candidate_template_matches.csv
+SEED/ground_truth_appended_images.csv

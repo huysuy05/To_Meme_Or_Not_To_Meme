@@ -76,13 +76,14 @@ class DataLoader:
     
 
 
-dataset_path = "/Volumes/huysuy05/ssd_data/meme_or_not/IMGFlip2024_haslabel"
-loader = DataLoader(dataset_path)
+if __name__ == "__main__":
+    dataset_path = "/Volumes/huysuy05/ssd_data/meme_or_not/IMGFlip2024_haslabel"
+    loader = DataLoader(dataset_path)
 
-print("Total templates:", loader.count_templates())
-loader.display_templates(10)
-template_name, image_list = loader.display_tpl_image(max_images=9)
-print(f"Selected template: {template_name}")
-print(f"Total images in selected template: {len(image_list)}")
-names = loader.get_template_names()
-print(names[:10]) 
+    print("Total templates:", loader.count_templates())
+    loader.display_templates(10)
+    template_name, image_list = loader.display_tpl_image(max_images=9)
+    print(f"Selected template: {template_name}")
+    print(f"Total images in selected template: {len(image_list)}")
+    names = loader.get_template_names()
+    print(names[:10])

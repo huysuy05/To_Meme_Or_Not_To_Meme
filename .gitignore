@@ -21,3 +21,4 @@ SEED/view_newly_assigned_images.py
 SEED/candidate_template_matches.csv
 SEED/ground_truth_appended_images.csv
 SEED/embedding_cache
+SEED/models/

@@ -31,6 +31,9 @@ from transformers import AutoImageProcessor, Dinov2Model, SiglipVisionModel
 
 
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".gif"}
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+MODEL_CACHE_DIR = PROJECT_ROOT / "SEED" / "models"
 
 
 @dataclass(frozen=True)
@@ -62,6 +65,7 @@ class RunConfig:
     train_size: float = 0.80
     cv_folds: int = 1
     tuning_val_size: float = 0.10
+    min_images_per_class: int = 7
     random_seed: int = 42
     batch_size: int = 16
     eval_batch_size: int = 32
@@ -82,6 +86,9 @@ class RunConfig:
     betas: tuple[float, ...] = (0.15,)
     taus: tuple[float, ...] = (0.85,)
     deltas: tuple[float, ...] = (0.10,)
+    early_stopping_patience: int = 2
+    early_stopping_min_delta: float = 1e-4
+    final_train_val_size: float = 0.10
 
 
 def parse_float_list(text: str) -> tuple[float, ...]:
@@ -109,6 +116,31 @@ def pick_device() -> torch.device:
 def l2_normalize(array: np.ndarray) -> np.ndarray:
     norms = np.linalg.norm(array, axis=-1, keepdims=True)
     return array / np.clip(norms, 1e-12, None)
+
+
+def split_train_for_early_stopping(
+    df: pd.DataFrame,
+    val_size: float,
+    random_seed: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if not 0.0 < val_size < 1.0:
+        raise ValueError(f"final_train_val_size must be in (0, 1), got {val_size}")
+
+    rng = np.random.default_rng(random_seed)
+    val_indices: list[int] = []
+    for _, group in df.groupby("label_idx", sort=False):
+        group_indices = group.index.to_numpy()
+        rng.shuffle(group_indices)
+        take = max(1, int(round(len(group_indices) * val_size)))
+        take = min(take, len(group_indices) - 1)
+        if take <= 0:
+            raise ValueError("Unable to create an early-stopping validation split with the current class counts.")
+        val_indices.extend(group_indices[:take].tolist())
+
+    val_idx_set = set(val_indices)
+    train_split = df.loc[[idx for idx in df.index if idx not in val_idx_set]].reset_index(drop=True)
+    val_split = df.loc[sorted(val_idx_set)].reset_index(drop=True)
+    return train_split, val_split
 
 
 def load_rgb_image(path: str | Path) -> Image.Image | None:
@@ -205,42 +237,17 @@ def check_class_counts(
             )
 
 
-def minimum_images_required(train_size: float, cv_folds: int, tuning_val_size: float) -> int:
-    required = 2
-    while True:
-        train_count = int(np.floor(required * train_size))
-        if train_count < 2:
-            required += 1
-            continue
-        if cv_folds > 1:
-            if train_count >= cv_folds:
-                return required
-        else:
-            inner_train_count = int(np.floor(train_count * (1.0 - tuning_val_size)))
-            inner_val_count = train_count - inner_train_count
-            if inner_train_count >= 1 and inner_val_count >= 1:
-                return required
-        required += 1
-
-
 def drop_small_classes(
     df: pd.DataFrame,
-    cv_folds: int,
-    train_size: float,
-    tuning_val_size: float,
+    min_images_per_class: int,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    min_required = minimum_images_required(
-        train_size=train_size,
-        cv_folds=cv_folds,
-        tuning_val_size=tuning_val_size,
-    )
     counts = df["template"].value_counts()
-    keep_templates = counts[counts >= min_required].index
+    keep_templates = counts[counts >= min_images_per_class].index
     filtered = df[df["template"].isin(keep_templates)].copy().reset_index(drop=True)
 
-    removed_templates = counts[counts < min_required]
+    removed_templates = counts[counts < min_images_per_class]
     summary = {
-        "min_images_required_per_class": int(min_required),
+        "min_images_required_per_class": int(min_images_per_class),
         "templates_before": int(counts.shape[0]),
         "templates_after": int(filtered["template"].nunique()),
         "templates_removed": int(removed_templates.shape[0]),
@@ -376,6 +383,10 @@ def accuracy_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> float:
     return (preds == labels).float().mean().item()
 
 
+def persistent_model_path(backbone_kind: str) -> Path:
+    return MODEL_CACHE_DIR / f"{backbone_kind}_best.pt"
+
+
 def train_single_model(
     backbone_kind: str,
     model_id: str,
@@ -391,6 +402,51 @@ def train_single_model(
     model = VisionClassifier(backbone_kind=backbone_kind, model_id=model_id, num_classes=len(label_names))
     prepare_model_for_training(model, train_backbone=run_cfg.train_backbone)
     model.to(device)
+    effective_train_df = train_df.reset_index(drop=True)
+    effective_val_df = None if val_df is None else val_df.reset_index(drop=True)
+
+    if effective_val_df is None and run_cfg.early_stopping_patience > 0:
+        effective_train_df, effective_val_df = split_train_for_early_stopping(
+            effective_train_df,
+            val_size=run_cfg.final_train_val_size,
+            random_seed=run_cfg.random_seed,
+        )
+        print(
+            f"[{backbone_kind}] using internal early-stopping split: "
+            f"train={len(effective_train_df)} val={len(effective_val_df)}"
+        )
+
+    MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = persistent_model_path(backbone_kind)
+
+    if checkpoint_path.exists():
+        print(f"[{backbone_kind}] loading cached checkpoint: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        cached_label_names = checkpoint.get("label_names")
+        cached_num_classes = len(cached_label_names) if isinstance(cached_label_names, list) else None
+        current_num_classes = len(label_names)
+
+        if cached_num_classes is not None and cached_num_classes != current_num_classes:
+            print(
+                f"[{backbone_kind}] cached checkpoint is incompatible "
+                f"(cached classes={cached_num_classes}, current classes={current_num_classes}); retraining."
+            )
+        else:
+            try:
+                model.load_state_dict(checkpoint["model_state_dict"])
+                model.eval()
+                metrics = {
+                    "best_val_acc": float(checkpoint.get("best_val_acc", float("nan"))),
+                    "best_val_loss": float(checkpoint.get("best_val_loss", float("nan"))),
+                    "best_epoch": float(checkpoint.get("best_epoch", float("nan"))),
+                    "epochs": float(hyperparams.epochs),
+                    "lr": float(hyperparams.lr),
+                    "weight_decay": float(hyperparams.weight_decay),
+                }
+                return model, metrics
+            except RuntimeError as exc:
+                print(f"[{backbone_kind}] cached checkpoint is incompatible ({exc}); retraining.")
 
     optimizer = AdamW(
         [param for param in model.parameters() if param.requires_grad],
@@ -401,8 +457,8 @@ def train_single_model(
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     train_loader = build_loader(
-        paths=train_df["image_path"].tolist(),
-        labels=train_df["label_idx"].tolist(),
+        paths=effective_train_df["image_path"].tolist(),
+        labels=effective_train_df["label_idx"].tolist(),
         processor=processor,
         batch_size=run_cfg.batch_size,
         num_workers=run_cfg.num_workers,
@@ -410,10 +466,10 @@ def train_single_model(
         include_labels=True,
     )
     val_loader = None
-    if val_df is not None:
+    if effective_val_df is not None:
         val_loader = build_loader(
-            paths=val_df["image_path"].tolist(),
-            labels=val_df["label_idx"].tolist(),
+            paths=effective_val_df["image_path"].tolist(),
+            labels=effective_val_df["label_idx"].tolist(),
             processor=processor,
             batch_size=run_cfg.eval_batch_size,
             num_workers=run_cfg.num_workers,
@@ -421,11 +477,11 @@ def train_single_model(
             include_labels=True,
         )
 
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = checkpoint_dir / f"{backbone_kind}_best.pt"
-
     best_val_acc = -1.0
+    best_val_loss = float("inf")
     best_train_loss = float("inf")
+    best_epoch = 0
+    epochs_without_improvement = 0
     history: list[dict[str, float]] = []
 
     for epoch in range(1, hyperparams.epochs + 1):
@@ -479,13 +535,20 @@ def train_single_model(
 
         should_save = False
         if val_loader is not None:
-            if val_metrics["accuracy"] > best_val_acc:
+            current_val_loss = val_metrics["loss"]
+            if current_val_loss < best_val_loss - run_cfg.early_stopping_min_delta:
+                best_val_loss = current_val_loss
                 best_val_acc = val_metrics["accuracy"]
+                best_epoch = epoch
+                epochs_without_improvement = 0
                 should_save = True
+            else:
+                epochs_without_improvement += 1
         else:
             current_train_loss = epoch_summary["train_loss"]
             if current_train_loss < best_train_loss:
                 best_train_loss = current_train_loss
+                best_epoch = epoch
                 should_save = True
 
         if should_save:
@@ -496,10 +559,21 @@ def train_single_model(
                     "model_id": model_id,
                     "label_names": label_names,
                     "hyperparams": asdict(hyperparams),
+                    "best_val_acc": float(best_val_acc) if val_loader is not None else float("nan"),
+                    "best_val_loss": float(best_val_loss) if val_loader is not None else float("nan"),
+                    "best_epoch": float(best_epoch),
                     "history": history,
                 },
                 checkpoint_path,
             )
+
+        if val_loader is not None and run_cfg.early_stopping_patience > 0:
+            if epochs_without_improvement >= run_cfg.early_stopping_patience:
+                print(
+                    f"[{backbone_kind}] early stopping at epoch={epoch} "
+                    f"(best_epoch={best_epoch}, best_val_loss={best_val_loss:.4f})"
+                )
+                break
 
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -510,6 +584,8 @@ def train_single_model(
 
     return model, {
         "best_val_acc": float(best_val_acc) if val_loader is not None else float("nan"),
+        "best_val_loss": float(best_val_loss) if val_loader is not None else float("nan"),
+        "best_epoch": float(best_epoch) if best_epoch else float("nan"),
         "epochs": float(hyperparams.epochs),
         "lr": float(hyperparams.lr),
         "weight_decay": float(hyperparams.weight_decay),
@@ -1171,6 +1247,7 @@ def build_run_config(args: argparse.Namespace) -> RunConfig:
         train_size=args.train_size,
         cv_folds=args.cv_folds,
         tuning_val_size=args.tuning_val_size,
+        min_images_per_class=args.min_images_per_class,
         random_seed=args.random_seed,
         batch_size=args.batch_size,
         eval_batch_size=args.eval_batch_size,
@@ -1191,6 +1268,9 @@ def build_run_config(args: argparse.Namespace) -> RunConfig:
         betas=args.betas,
         taus=args.taus,
         deltas=args.deltas,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_min_delta=args.early_stopping_min_delta,
+        final_train_val_size=args.final_train_val_size,
     )
 
 
@@ -1220,6 +1300,12 @@ def make_parser() -> argparse.ArgumentParser:
         default=0.20,
         help="Validation fraction used inside the training split when --cv-folds=1.",
     )
+    parser.add_argument(
+        "--min-images-per-class",
+        type=int,
+        default=7,
+        help="Drop templates with fewer than this many images before any split.",
+    )
     parser.add_argument("--random-seed", type=int, default=42)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--eval-batch-size", type=int, default=32)
@@ -1235,6 +1321,24 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--betas", type=parse_float_list, default=(0.15,))
     parser.add_argument("--taus", type=parse_float_list, default=(0.85,))
     parser.add_argument("--deltas", type=parse_float_list, default=(0.10,))
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=2,
+        help="Stop fine-tuning when validation loss does not improve for this many epochs. Set 0 to disable.",
+    )
+    parser.add_argument(
+        "--early-stopping-min-delta",
+        type=float,
+        default=1e-4,
+        help="Minimum validation-loss improvement required to reset early stopping.",
+    )
+    parser.add_argument(
+        "--final-train-val-size",
+        type=float,
+        default=0.10,
+        help="Per-class holdout fraction used for early stopping during the final retrain stage.",
+    )
     parser.add_argument("--max-templates", type=int, default=None)
     parser.add_argument("--max-images-per-template", type=int, default=None)
     parser.add_argument(
@@ -1278,9 +1382,7 @@ def main() -> None:
     dataset_df = filter_valid_image_rows(dataset_df)
     dataset_df, filtering_summary = drop_small_classes(
         dataset_df,
-        cv_folds=run_cfg.cv_folds,
-        train_size=run_cfg.train_size,
-        tuning_val_size=run_cfg.tuning_val_size,
+        min_images_per_class=run_cfg.min_images_per_class,
     )
     if filtering_summary["templates_removed"] > 0:
         print(

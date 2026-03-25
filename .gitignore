@@ -22,3 +22,4 @@ SEED/candidate_template_matches.csv
 SEED/ground_truth_appended_images.csv
 SEED/embedding_cache
 SEED/models/
+SEED/runs/

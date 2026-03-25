@@ -1,0 +1,904 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import time
+from contextlib import nullcontext
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps, UnidentifiedImageError
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+from sklearn.metrics import (
+    accuracy_score,
+    cohen_kappa_score,
+    matthews_corrcoef,
+    precision_recall_fscore_support,
+)
+from sklearn.model_selection import train_test_split
+from tqdm.auto import tqdm
+from transformers import AutoImageProcessor, Dinov2Model, SiglipVisionModel
+from torch.optim import AdamW
+from torch.utils.data import DataLoader, Dataset
+
+
+VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".gif"}
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+
+
+@dataclass
+class RunConfig:
+    imgflip_root: Path
+    output_dir: Path
+    train_size: float = 0.80
+    min_images_per_class: int = 7
+    random_seed: int = 42
+    batch_size: int = 16
+    num_workers: int = 0
+    siglip_model_id: str = "google/siglip2-base-patch16-224"
+    dino_model_id: str = "facebook/dinov2-base"
+    alpha: float = 0.65
+    reducer: str = "pca"
+    reducer_dim: int = 128
+    cluster_method: str = "kmeans"
+    kmeans_clusters: int | None = None
+    refinement_steps: int = 1
+    max_templates: int | None = None
+    max_images_per_template: int | None = None
+    max_unlabeled_images: int | None = None
+    use_ssft: bool = False
+    ssft_epochs: int = 1
+    ssft_lr: float = 1e-5
+    ssft_weight_decay: float = 1e-4
+    ssft_temperature: float = 0.1
+    ssft_projection_dim: int = 256
+    ssft_early_stopping_patience: int = 2
+    ssft_early_stopping_min_delta: float = 1e-4
+    ssft_val_size: float = 0.10
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def pick_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def l2_normalize(array: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(array, axis=-1, keepdims=True)
+    return array / np.clip(norms, 1e-12, None)
+
+
+def load_rgb_image(path: str | Path) -> Image.Image | None:
+    try:
+        with Image.open(path) as img:
+            return ImageOps.exif_transpose(img).convert("RGB")
+    except (UnidentifiedImageError, OSError, ValueError):
+        return None
+
+
+def collect_labeled_rows(
+    root: Path,
+    max_templates: int | None = None,
+    max_images_per_template: int | None = None,
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    template_dirs = sorted([path for path in root.iterdir() if path.is_dir()])
+    if max_templates is not None:
+        template_dirs = template_dirs[:max_templates]
+
+    for template_dir in template_dirs:
+        image_paths = sorted(
+            [path for path in template_dir.iterdir() if path.is_file() and path.suffix.lower() in VALID_EXTS]
+        )
+        if max_images_per_template is not None:
+            image_paths = image_paths[:max_images_per_template]
+        for image_path in image_paths:
+            rows.append(
+                {
+                    "image_path": str(image_path),
+                    "template": template_dir.name,
+                    "source": "imgflip",
+                }
+            )
+
+    if not rows:
+        raise ValueError(f"No labeled images found under {root}")
+    return pd.DataFrame(rows)
+
+
+def split_labeled_and_unlabeled_from_train(
+    train_df: pd.DataFrame,
+    max_unlabeled_images: int | None,
+    random_seed: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if max_unlabeled_images is None or max_unlabeled_images <= 0:
+        return train_df.reset_index(drop=True), pd.DataFrame(columns=train_df.columns)
+
+    sample_n = min(int(max_unlabeled_images), len(train_df))
+    unlabeled_idx = (
+        train_df.sample(n=sample_n, random_state=random_seed, replace=False).index
+        if sample_n > 0
+        else []
+    )
+    labeled_df = train_df.drop(index=unlabeled_idx).reset_index(drop=True)
+    unlabeled_df = train_df.loc[unlabeled_idx].reset_index(drop=True).copy()
+    if not unlabeled_df.empty:
+        unlabeled_df["template"] = "UNLABELED"
+        unlabeled_df["source"] = "imgflip_unlabeled"
+    return labeled_df, unlabeled_df
+
+
+def filter_valid_image_rows(df: pd.DataFrame) -> pd.DataFrame:
+    keep_rows: list[bool] = []
+    for image_path in tqdm(df["image_path"].tolist(), desc="verify images"):
+        keep_rows.append(load_rgb_image(image_path) is not None)
+    filtered = df[keep_rows].reset_index(drop=True)
+    dropped = len(df) - len(filtered)
+    if dropped:
+        print(f"Dropped {dropped} unreadable images.")
+    return filtered
+
+
+def drop_small_classes(df: pd.DataFrame, min_images_per_class: int) -> tuple[pd.DataFrame, dict[str, Any]]:
+    counts = df["template"].value_counts()
+    keep_templates = counts[counts >= min_images_per_class].index
+    filtered = df[df["template"].isin(keep_templates)].copy().reset_index(drop=True)
+    removed = counts[counts < min_images_per_class]
+    summary = {
+        "min_images_required_per_class": int(min_images_per_class),
+        "templates_before": int(counts.shape[0]),
+        "templates_after": int(filtered["template"].nunique()),
+        "templates_removed": int(removed.shape[0]),
+        "images_before": int(len(df)),
+        "images_after": int(len(filtered)),
+        "images_removed": int(len(df) - len(filtered)),
+        "removed_template_examples": removed.head(20).to_dict(),
+    }
+    return filtered, summary
+
+
+class FrozenImageEmbedder:
+    def __init__(self, model_id: str, kind: str, device: torch.device, batch_size: int):
+        self.model_id = model_id
+        self.kind = kind
+        self.device = device
+        self.batch_size = batch_size
+        self.processor = AutoImageProcessor.from_pretrained(model_id)
+        if kind == "siglip":
+            self.model = SiglipVisionModel.from_pretrained(model_id).to(device)
+        elif kind == "dino":
+            self.model = Dinov2Model.from_pretrained(model_id).to(device)
+        else:
+            raise ValueError(f"Unsupported kind={kind}")
+        self.model.eval()
+
+    @torch.inference_mode()
+    def encode_paths(self, paths: list[str], desc: str) -> tuple[np.ndarray, list[str]]:
+        vectors: list[torch.Tensor] = []
+        kept_paths: list[str] = []
+        for start in tqdm(range(0, len(paths), self.batch_size), desc=desc):
+            batch_paths = paths[start:start + self.batch_size]
+            images = []
+            valid_paths = []
+            for path in batch_paths:
+                image = load_rgb_image(path)
+                if image is not None:
+                    images.append(image)
+                    valid_paths.append(path)
+
+            if not images:
+                continue
+
+            inputs = self.processor(images=images, return_tensors="pt")
+            inputs = {name: tensor.to(self.device) for name, tensor in inputs.items()}
+            outputs = self.model(**inputs)
+            pooled = getattr(outputs, "pooler_output", None)
+            if pooled is None:
+                pooled = outputs.last_hidden_state[:, 0]
+            pooled = F.normalize(pooled.float(), dim=-1)
+            vectors.append(pooled.cpu())
+            kept_paths.extend(valid_paths)
+
+        if not vectors:
+            raise ValueError(f"No valid images were encoded for {desc}")
+        return torch.cat(vectors, dim=0).numpy(), kept_paths
+
+
+class PathDataset(Dataset):
+    def __init__(self, paths: list[str]):
+        self.paths = paths
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, index: int) -> str:
+        return self.paths[index]
+
+
+class SSFTCollator:
+    def __init__(self, processor):
+        self.processor = processor
+
+    def __call__(self, batch: list[str]) -> dict[str, Any] | None:
+        view1: list[Image.Image] = []
+        view2: list[Image.Image] = []
+        kept_paths: list[str] = []
+
+        for image_path in batch:
+            image = load_rgb_image(image_path)
+            if image is None:
+                continue
+            view1.append(make_ssft_view(image))
+            view2.append(make_ssft_view(image))
+            kept_paths.append(image_path)
+
+        if not kept_paths:
+            return None
+
+        inputs1 = self.processor(images=view1, return_tensors="pt")
+        inputs2 = self.processor(images=view2, return_tensors="pt")
+        return {"view1": dict(inputs1), "view2": dict(inputs2), "paths": kept_paths}
+
+
+class ProjectionHead(nn.Module):
+    def __init__(self, hidden_size: int, projection_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, projection_dim),
+        )
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return F.normalize(self.net(features), dim=-1)
+
+
+def make_ssft_view(image: Image.Image) -> Image.Image:
+    width, height = image.size
+    crop_scale = random.uniform(0.90, 1.00)
+    crop_w = max(1, int(width * crop_scale))
+    crop_h = max(1, int(height * crop_scale))
+    if crop_w < width:
+        left = random.randint(0, width - crop_w)
+    else:
+        left = 0
+    if crop_h < height:
+        top = random.randint(0, height - crop_h)
+    else:
+        top = 0
+    cropped = image.crop((left, top, left + crop_w, top + crop_h)).resize((width, height), Image.Resampling.BICUBIC)
+
+    brightness = random.uniform(0.90, 1.10)
+    contrast = random.uniform(0.90, 1.10)
+    saturated = ImageEnhance.Brightness(cropped).enhance(brightness)
+    saturated = ImageEnhance.Contrast(saturated).enhance(contrast)
+
+    if random.random() < 0.20:
+        saturated = saturated.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.1, 0.8)))
+
+    return saturated
+
+
+def pooled_output(outputs: Any) -> torch.Tensor:
+    pooled = getattr(outputs, "pooler_output", None)
+    if pooled is not None:
+        return pooled
+    return outputs.last_hidden_state[:, 0]
+
+
+def move_batch_to_device(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
+    return {name: tensor.to(device) for name, tensor in batch.items()}
+
+
+def nt_xent_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float) -> torch.Tensor:
+    representations = F.normalize(torch.cat([z1, z2], dim=0), dim=-1)
+    logits = representations @ representations.T
+    logits = logits / temperature
+    batch_size = z1.shape[0]
+    logits = logits.masked_fill(
+        torch.eye(2 * batch_size, device=logits.device, dtype=torch.bool),
+        float("-inf"),
+    )
+    targets = torch.arange(2 * batch_size, device=logits.device)
+    targets = (targets + batch_size) % (2 * batch_size)
+    return F.cross_entropy(logits, targets)
+
+
+def split_paths_for_ssft(
+    paths: list[str],
+    val_size: float,
+    random_seed: int,
+) -> tuple[list[str], list[str]]:
+    if len(paths) < 2:
+        return paths, []
+    if not 0.0 < val_size < 1.0:
+        raise ValueError(f"ssft_val_size must be in (0, 1), got {val_size}")
+    rng = random.Random(random_seed)
+    shuffled = paths.copy()
+    rng.shuffle(shuffled)
+    val_count = max(1, int(round(len(shuffled) * val_size)))
+    val_count = min(val_count, len(shuffled) - 1)
+    return shuffled[val_count:], shuffled[:val_count]
+
+
+@torch.inference_mode()
+def evaluate_ssft(
+    model: nn.Module,
+    projector: ProjectionHead,
+    data_loader: DataLoader,
+    device: torch.device,
+    temperature: float,
+) -> float:
+    model.eval()
+    projector.eval()
+    losses: list[float] = []
+    for batch in data_loader:
+        if batch is None:
+            continue
+        view1 = move_batch_to_device(batch["view1"], device)
+        view2 = move_batch_to_device(batch["view2"], device)
+        features1 = pooled_output(model(**view1)).float()
+        features2 = pooled_output(model(**view2)).float()
+        z1 = projector(features1)
+        z2 = projector(features2)
+        losses.append(float(nt_xent_loss(z1, z2, temperature=temperature).item()))
+    return float(np.mean(losses)) if losses else float("nan")
+
+
+def run_ssft(
+    embedder: FrozenImageEmbedder,
+    discovery_paths: list[str],
+    cfg: RunConfig,
+    device: torch.device,
+    run_dir: Path,
+) -> dict[str, Any]:
+    if not discovery_paths:
+        raise ValueError("SSFT requested, but discovery set is empty.")
+
+    train_paths = discovery_paths
+    val_paths: list[str] = []
+    if cfg.ssft_early_stopping_patience > 0:
+        train_paths, val_paths = split_paths_for_ssft(
+            discovery_paths,
+            val_size=cfg.ssft_val_size,
+            random_seed=cfg.random_seed,
+        )
+        print(f"[ssft-{embedder.kind}] train={len(train_paths)} val={len(val_paths)}")
+
+    data_loader = DataLoader(
+        PathDataset(train_paths),
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        num_workers=cfg.num_workers,
+        collate_fn=SSFTCollator(embedder.processor),
+        pin_memory=torch.cuda.is_available(),
+    )
+    val_loader = None
+    if val_paths:
+        val_loader = DataLoader(
+            PathDataset(val_paths),
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            num_workers=cfg.num_workers,
+            collate_fn=SSFTCollator(embedder.processor),
+            pin_memory=torch.cuda.is_available(),
+        )
+    hidden_size = int(embedder.model.config.hidden_size)
+    projector = ProjectionHead(hidden_size=hidden_size, projection_dim=cfg.ssft_projection_dim).to(device)
+    optimizer = AdamW(
+        list(embedder.model.parameters()) + list(projector.parameters()),
+        lr=cfg.ssft_lr,
+        weight_decay=cfg.ssft_weight_decay,
+    )
+    use_amp = device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    history: list[dict[str, float]] = []
+    checkpoint_path = run_dir / f"ssft_{embedder.kind}.pt"
+    best_val_loss = float("inf")
+    best_train_loss = float("inf")
+    best_epoch = 0
+    epochs_without_improvement = 0
+
+    embedder.model.train()
+    projector.train()
+
+    for epoch in range(1, cfg.ssft_epochs + 1):
+        epoch_losses: list[float] = []
+        for batch in tqdm(data_loader, desc=f"ssft {embedder.kind} epoch {epoch}", leave=False):
+            if batch is None:
+                continue
+
+            view1 = move_batch_to_device(batch["view1"], device)
+            view2 = move_batch_to_device(batch["view2"], device)
+            optimizer.zero_grad(set_to_none=True)
+            amp_context = (
+                torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True)
+                if use_amp
+                else nullcontext()
+            )
+            with amp_context:
+                features1 = pooled_output(embedder.model(**view1)).float()
+                features2 = pooled_output(embedder.model(**view2)).float()
+                z1 = projector(features1)
+                z2 = projector(features2)
+                loss = nt_xent_loss(z1, z2, temperature=cfg.ssft_temperature)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            epoch_losses.append(float(loss.item()))
+
+        mean_loss = float(np.mean(epoch_losses)) if epoch_losses else float("nan")
+        val_loss = float("nan")
+        if val_loader is not None:
+            val_loss = evaluate_ssft(
+                embedder.model,
+                projector,
+                val_loader,
+                device=device,
+                temperature=cfg.ssft_temperature,
+            )
+            embedder.model.train()
+            projector.train()
+        history.append(
+            {
+                "epoch": float(epoch),
+                "train_contrastive_loss": mean_loss,
+                "val_contrastive_loss": val_loss,
+            }
+        )
+        print(
+            f"[ssft-{embedder.kind}] epoch={epoch} "
+            f"train_loss={mean_loss:.4f} val_loss={val_loss:.4f}"
+        )
+
+        should_save = False
+        if val_loader is not None:
+            if val_loss < best_val_loss - cfg.ssft_early_stopping_min_delta:
+                best_val_loss = val_loss
+                best_epoch = epoch
+                epochs_without_improvement = 0
+                should_save = True
+            else:
+                epochs_without_improvement += 1
+        else:
+            if mean_loss < best_train_loss:
+                best_train_loss = mean_loss
+                best_epoch = epoch
+                should_save = True
+
+        if should_save:
+            torch.save(
+                {
+                    "kind": embedder.kind,
+                    "model_id": embedder.model_id,
+                    "ssft_epochs": cfg.ssft_epochs,
+                    "ssft_lr": cfg.ssft_lr,
+                    "ssft_weight_decay": cfg.ssft_weight_decay,
+                    "ssft_temperature": cfg.ssft_temperature,
+                    "best_epoch": float(best_epoch),
+                    "best_val_loss": float(best_val_loss) if val_loader is not None else float("nan"),
+                    "history": history,
+                    "model_state_dict": embedder.model.state_dict(),
+                },
+                checkpoint_path,
+            )
+
+        if val_loader is not None and cfg.ssft_early_stopping_patience > 0:
+            if epochs_without_improvement >= cfg.ssft_early_stopping_patience:
+                print(
+                    f"[ssft-{embedder.kind}] early stopping at epoch={epoch} "
+                    f"(best_epoch={best_epoch}, best_val_loss={best_val_loss:.4f})"
+                )
+                break
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    embedder.model.load_state_dict(checkpoint["model_state_dict"])
+    embedder.model.eval()
+    return {
+        "checkpoint_path": str(checkpoint_path),
+        "history": history,
+        "best_epoch": float(best_epoch) if best_epoch else float("nan"),
+        "best_val_loss": float(best_val_loss) if val_loader is not None else float("nan"),
+    }
+
+
+def align_dataframe(df: pd.DataFrame, kept_paths: list[str]) -> pd.DataFrame:
+    path_to_index = {path: idx for idx, path in enumerate(df["image_path"].tolist())}
+    return df.iloc[[path_to_index[path] for path in kept_paths]].reset_index(drop=True)
+
+
+def fused_embedding(siglip: np.ndarray, dino: np.ndarray, alpha: float) -> np.ndarray:
+    left = np.sqrt(alpha) * siglip
+    right = np.sqrt(1.0 - alpha) * dino
+    return l2_normalize(np.concatenate([left, right], axis=1))
+
+
+class IdentityReducer:
+    def fit_transform(self, x: np.ndarray) -> np.ndarray:
+        return x
+
+    def transform(self, x: np.ndarray) -> np.ndarray:
+        return x
+
+
+def build_reducer(method: str, n_components: int, random_seed: int):
+    method = method.lower()
+    if method == "none":
+        return IdentityReducer()
+    if method == "pca":
+        return PCA(n_components=n_components, random_state=random_seed)
+    if method == "umap":
+        try:
+            import umap  # type: ignore
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "UMAP is not installed. Install `umap-learn` or use --reducer pca."
+            ) from exc
+        return umap.UMAP(
+            n_components=n_components,
+            random_state=random_seed,
+            metric="cosine",
+        )
+    raise ValueError(f"Unsupported reducer={method}")
+
+
+def fit_clusterer(method: str, x: np.ndarray, num_clusters: int, random_seed: int):
+    method = method.lower()
+    if method == "kmeans":
+        model = KMeans(n_clusters=num_clusters, random_state=random_seed, n_init="auto")
+        labels = model.fit_predict(x)
+        return model, labels
+    if method == "hdbscan":
+        try:
+            from sklearn.cluster import HDBSCAN as SklearnHDBSCAN
+
+            model = SklearnHDBSCAN(min_cluster_size=10)
+            labels = model.fit_predict(x)
+            return model, labels
+        except Exception:
+            try:
+                import hdbscan  # type: ignore
+
+                model = hdbscan.HDBSCAN(min_cluster_size=10, prediction_data=True)
+                labels = model.fit_predict(x)
+                return model, labels
+            except ModuleNotFoundError as exc:
+                raise ModuleNotFoundError(
+                    "HDBSCAN is not installed. Install `scikit-learn>=1.3` or `hdbscan`, "
+                    "or use --cluster-method kmeans."
+                ) from exc
+    raise ValueError(f"Unsupported cluster_method={method}")
+
+
+def compute_centroids(x: np.ndarray, labels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    valid_clusters = np.array(sorted([cluster for cluster in np.unique(labels) if cluster >= 0]))
+    if valid_clusters.size == 0:
+        raise ValueError("No non-noise clusters were found.")
+    centroids = []
+    for cluster_id in valid_clusters:
+        mask = labels == cluster_id
+        centroids.append(l2_normalize(x[mask].mean(axis=0, keepdims=True))[0])
+    return np.vstack(centroids), valid_clusters
+
+
+def assign_to_centroids(x: np.ndarray, centroids: np.ndarray, centroid_ids: np.ndarray) -> np.ndarray:
+    scores = x @ centroids.T
+    best = scores.argmax(axis=1)
+    return centroid_ids[best]
+
+
+def refine_clusters(x: np.ndarray, labels: np.ndarray, steps: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    refined_labels = labels.copy()
+    centroids, centroid_ids = compute_centroids(x, refined_labels)
+    for _ in range(max(steps, 0)):
+        refined_labels = assign_to_centroids(x, centroids, centroid_ids)
+        centroids, centroid_ids = compute_centroids(x, refined_labels)
+    return refined_labels, centroids, centroid_ids
+
+
+def majority_vote_mapping(discovery_df: pd.DataFrame, cluster_labels: np.ndarray) -> dict[int, str]:
+    mapping: dict[int, str] = {}
+    labeled_mask = discovery_df["source"].eq("imgflip_train").to_numpy()
+    labeled_templates = discovery_df.loc[labeled_mask, "template"].to_numpy()
+    labeled_clusters = cluster_labels[labeled_mask]
+
+    for cluster_id in sorted(set(labeled_clusters.tolist())):
+        if cluster_id < 0:
+            continue
+        cluster_templates = labeled_templates[labeled_clusters == cluster_id]
+        if cluster_templates.size == 0:
+            continue
+        values, counts = np.unique(cluster_templates, return_counts=True)
+        mapping[int(cluster_id)] = str(values[counts.argmax()])
+    return mapping
+
+
+def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        y_true,
+        y_pred,
+        average="macro",
+        zero_division=0,
+    )
+    return {
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1),
+        "mcc": float(matthews_corrcoef(y_true, y_pred)),
+        "cohen_kappa": float(cohen_kappa_score(y_true, y_pred)),
+    }
+
+
+def build_run_config(args: argparse.Namespace) -> RunConfig:
+    return RunConfig(
+        imgflip_root=Path(args.imgflip_root).expanduser().resolve(),
+        output_dir=Path(args.output_dir).expanduser().resolve(),
+        train_size=args.train_size,
+        min_images_per_class=args.min_images_per_class,
+        random_seed=args.random_seed,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        siglip_model_id=args.siglip_model_id,
+        dino_model_id=args.dino_model_id,
+        alpha=args.alpha,
+        reducer=args.reducer,
+        reducer_dim=args.reducer_dim,
+        cluster_method=args.cluster_method,
+        kmeans_clusters=args.kmeans_clusters,
+        refinement_steps=args.refinement_steps,
+        max_templates=args.max_templates,
+        max_images_per_template=args.max_images_per_template,
+        max_unlabeled_images=args.max_unlabeled_images,
+        use_ssft=args.use_ssft,
+        ssft_epochs=args.ssft_epochs,
+        ssft_lr=args.ssft_lr,
+        ssft_weight_decay=args.ssft_weight_decay,
+        ssft_temperature=args.ssft_temperature,
+        ssft_projection_dim=args.ssft_projection_dim,
+        ssft_early_stopping_patience=args.ssft_early_stopping_patience,
+        ssft_early_stopping_min_delta=args.ssft_early_stopping_min_delta,
+        ssft_val_size=args.ssft_val_size,
+    )
+
+
+def make_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Unsupervised evaluation for frozen SigLIP + DINO using cluster discovery on "
+            "ImgFlip 80% plus optional unlabeled samples drawn from the ImgFlip training split, "
+            "then majority-vote cluster naming."
+        )
+    )
+    parser.add_argument("--imgflip-root", required=True, help="Labeled ImgFlip folder-of-folders root.")
+    parser.add_argument("--output-dir", default="SEED/runs/seed_unsupervised_eval")
+    parser.add_argument("--train-size", type=float, default=0.80)
+    parser.add_argument("--min-images-per-class", type=int, default=7)
+    parser.add_argument("--random-seed", type=int, default=42)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--siglip-model-id", default="google/siglip2-base-patch16-224")
+    parser.add_argument("--dino-model-id", default="facebook/dinov2-base")
+    parser.add_argument("--alpha", type=float, default=0.65)
+    parser.add_argument("--reducer", choices=["none", "pca", "umap"], default="pca")
+    parser.add_argument("--reducer-dim", type=int, default=128)
+    parser.add_argument("--cluster-method", choices=["kmeans", "hdbscan"], default="hdbscan")
+    parser.add_argument("--kmeans-clusters", type=int, default=None)
+    parser.add_argument("--refinement-steps", type=int, default=1)
+    parser.add_argument("--max-templates", type=int, default=None)
+    parser.add_argument("--max-images-per-template", type=int, default=None)
+    parser.add_argument(
+        "--max-unlabeled-images",
+        type=int,
+        default=None,
+        help="Randomly sample this many training images from ImgFlip and treat them as unlabeled discovery data.",
+    )
+    parser.add_argument(
+        "--use_SSFT",
+        "--use-ssft",
+        dest="use_ssft",
+        action="store_true",
+        help="Run self-supervised fine-tuning on the discovery split before clustering.",
+    )
+    parser.add_argument("--ssft-epochs", type=int, default=1)
+    parser.add_argument("--ssft-lr", type=float, default=1e-5)
+    parser.add_argument("--ssft-weight-decay", type=float, default=1e-4)
+    parser.add_argument("--ssft-temperature", type=float, default=0.1)
+    parser.add_argument("--ssft-projection-dim", type=int, default=256)
+    parser.add_argument(
+        "--ssft-early-stopping-patience",
+        type=int,
+        default=2,
+        help="Stop SSFT when validation contrastive loss does not improve for this many epochs. Set 0 to disable.",
+    )
+    parser.add_argument(
+        "--ssft-early-stopping-min-delta",
+        type=float,
+        default=1e-4,
+        help="Minimum validation-loss improvement required to reset SSFT early stopping.",
+    )
+    parser.add_argument(
+        "--ssft-val-size",
+        type=float,
+        default=0.10,
+        help="Holdout fraction used for SSFT early stopping on the discovery split.",
+    )
+    return parser
+
+
+def main() -> None:
+    args = make_parser().parse_args()
+    cfg = build_run_config(args)
+    set_seed(cfg.random_seed)
+    device = pick_device()
+
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    run_dir = cfg.output_dir / timestamp
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"device={device}")
+    print(f"run_dir={run_dir}")
+
+    imgflip_df = collect_labeled_rows(
+        cfg.imgflip_root,
+        max_templates=cfg.max_templates,
+        max_images_per_template=cfg.max_images_per_template,
+    )
+    imgflip_df = filter_valid_image_rows(imgflip_df)
+    imgflip_df, filtering_summary = drop_small_classes(imgflip_df, cfg.min_images_per_class)
+
+    train_imgflip_df, test_imgflip_df = train_test_split(
+        imgflip_df,
+        train_size=cfg.train_size,
+        stratify=imgflip_df["template"],
+        random_state=cfg.random_seed,
+    )
+    train_imgflip_df = train_imgflip_df.reset_index(drop=True)
+    test_imgflip_df = test_imgflip_df.reset_index(drop=True)
+    train_imgflip_df["source"] = "imgflip_train"
+    test_imgflip_df["source"] = "imgflip_test"
+
+    train_imgflip_df, unlabeled_imgflip_df = split_labeled_and_unlabeled_from_train(
+        train_imgflip_df,
+        max_unlabeled_images=cfg.max_unlabeled_images,
+        random_seed=cfg.random_seed,
+    )
+    discovery_parts = [train_imgflip_df]
+    unlabeled_count = len(unlabeled_imgflip_df)
+    if unlabeled_count:
+        discovery_parts.append(unlabeled_imgflip_df)
+
+    discovery_df = pd.concat(discovery_parts, ignore_index=True)
+
+    siglip = FrozenImageEmbedder(cfg.siglip_model_id, "siglip", device, cfg.batch_size)
+    dino = FrozenImageEmbedder(cfg.dino_model_id, "dino", device, cfg.batch_size)
+
+    discovery_paths = discovery_df["image_path"].tolist()
+    test_paths = test_imgflip_df["image_path"].tolist()
+    ssft_summary: dict[str, Any] | None = None
+
+    if cfg.use_ssft:
+        ssft_dir = run_dir / "ssft"
+        ssft_dir.mkdir(parents=True, exist_ok=True)
+        print(
+            "Running SSFT on discovery images: "
+            f"epochs={cfg.ssft_epochs} lr={cfg.ssft_lr:g} temp={cfg.ssft_temperature:g}"
+        )
+        ssft_summary = {
+            "enabled": True,
+            "discovery_images": int(len(discovery_paths)),
+            "siglip": run_ssft(siglip, discovery_paths, cfg, device, ssft_dir),
+            "dino": run_ssft(dino, discovery_paths, cfg, device, ssft_dir),
+        }
+    else:
+        ssft_summary = {"enabled": False}
+
+    discovery_siglip, kept_discovery_siglip = siglip.encode_paths(discovery_paths, desc="encode discovery siglip")
+    discovery_dino, kept_discovery_dino = dino.encode_paths(discovery_paths, desc="encode discovery dino")
+    test_siglip, kept_test_siglip = siglip.encode_paths(test_paths, desc="encode test siglip")
+    test_dino, kept_test_dino = dino.encode_paths(test_paths, desc="encode test dino")
+
+    if kept_discovery_siglip != kept_discovery_dino:
+        raise ValueError("Discovery embedding path mismatch between SigLIP and DINO.")
+    if kept_test_siglip != kept_test_dino:
+        raise ValueError("Test embedding path mismatch between SigLIP and DINO.")
+
+    discovery_df = align_dataframe(discovery_df, kept_discovery_siglip)
+    test_imgflip_df = align_dataframe(test_imgflip_df, kept_test_siglip)
+
+    discovery_fused = fused_embedding(discovery_siglip, discovery_dino, cfg.alpha)
+    test_fused = fused_embedding(test_siglip, test_dino, cfg.alpha)
+
+    reducer = build_reducer(cfg.reducer, cfg.reducer_dim, cfg.random_seed)
+    discovery_reduced = reducer.fit_transform(discovery_fused)
+    test_reduced = reducer.transform(test_fused)
+    discovery_reduced = l2_normalize(np.asarray(discovery_reduced, dtype=np.float32))
+    test_reduced = l2_normalize(np.asarray(test_reduced, dtype=np.float32))
+
+    num_clusters = cfg.kmeans_clusters or train_imgflip_df["template"].nunique()
+    clusterer, initial_labels = fit_clusterer(
+        method=cfg.cluster_method,
+        x=discovery_reduced,
+        num_clusters=num_clusters,
+        random_seed=cfg.random_seed,
+    )
+
+    refined_labels, centroids, centroid_ids = refine_clusters(
+        discovery_reduced,
+        initial_labels,
+        steps=cfg.refinement_steps,
+    )
+    cluster_to_template = majority_vote_mapping(discovery_df, refined_labels)
+    test_cluster_ids = assign_to_centroids(test_reduced, centroids, centroid_ids)
+    test_pred_templates = np.array([cluster_to_template.get(int(cluster_id), "UNKNOWN_CLUSTER") for cluster_id in test_cluster_ids])
+    y_true = test_imgflip_df["template"].to_numpy()
+
+    metrics = compute_metrics(y_true, test_pred_templates)
+
+    predictions_df = test_imgflip_df.copy()
+    predictions_df["pred_cluster"] = test_cluster_ids
+    predictions_df["pred_template"] = test_pred_templates
+    predictions_df["correct"] = predictions_df["pred_template"].to_numpy() == predictions_df["template"].to_numpy()
+    predictions_df.to_csv(run_dir / "test_predictions.csv", index=False)
+
+    run_metadata = {
+        "config": {
+            **asdict(cfg),
+            "imgflip_root": str(cfg.imgflip_root),
+            "output_dir": str(cfg.output_dir),
+            "device": str(device),
+        },
+        "dataset": {
+            "imgflip_images_total_after_filtering": int(len(imgflip_df)),
+            "imgflip_classes_after_filtering": int(imgflip_df["template"].nunique()),
+            "imgflip_train_images": int(len(train_imgflip_df)),
+            "imgflip_test_images": int(len(test_imgflip_df)),
+            "unlabeled_images_in_discovery": int(unlabeled_count),
+            "discovery_images_total": int(len(discovery_df)),
+            "small_class_filtering": filtering_summary,
+        },
+        "clustering": {
+            "cluster_method": cfg.cluster_method,
+            "requested_kmeans_clusters": int(num_clusters),
+            "discovered_cluster_count": int(len(centroid_ids)),
+            "mapped_cluster_count": int(len(cluster_to_template)),
+            "unknown_cluster_predictions": int((test_pred_templates == "UNKNOWN_CLUSTER").sum()),
+        },
+        "ssft": ssft_summary,
+        "test_metrics": metrics,
+    }
+    (run_dir / "run_config.json").write_text(json.dumps(run_metadata, indent=2))
+
+    print(f"imgflip_train_images={len(train_imgflip_df)} imgflip_test_images={len(test_imgflip_df)}")
+    print(f"discovery_images_total={len(discovery_df)}")
+    print(f"discovered_cluster_count={len(centroid_ids)} mapped_cluster_count={len(cluster_to_template)}")
+    print(f"test_accuracy={metrics['accuracy']:.4f}")
+    print(f"test_f1={metrics['f1']:.4f}")
+    print(f"test_precision={metrics['precision']:.4f}")
+    print(f"test_recall={metrics['recall']:.4f}")
+    print(f"test_mcc={metrics['mcc']:.4f}")
+    print(f"test_cohen_kappa={metrics['cohen_kappa']:.4f}")
+    print(f"predictions_saved={run_dir / 'test_predictions.csv'}")
+
+
+if __name__ == "__main__":
+    main()

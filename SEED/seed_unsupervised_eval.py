@@ -62,6 +62,8 @@ class RunConfig:
     ssft_weight_decay: float = 1e-4
     ssft_temperature: float = 0.1
     ssft_projection_dim: int = 256
+    ssft_objective: str = "ntxent"
+    ssft_deepcluster_clusters: int | None = None
     ssft_early_stopping_patience: int = 2
     ssft_early_stopping_min_delta: float = 1e-4
     ssft_val_size: float = 0.10
@@ -139,7 +141,7 @@ def split_labeled_and_unlabeled_from_train(
         if sample_n > 0
         else []
     )
-    labeled_df = train_df.drop(index=unlabeled_idx).reset_index(drop=True)
+    labeled_df = train_df.reset_index(drop=True).copy()
     unlabeled_df = train_df.loc[unlabeled_idx].reset_index(drop=True).copy()
     if not unlabeled_df.empty:
         unlabeled_df["template"] = "UNLABELED"
@@ -234,6 +236,18 @@ class PathDataset(Dataset):
         return self.paths[index]
 
 
+class LabeledPathDataset(Dataset):
+    def __init__(self, paths: list[str], labels: list[int]):
+        self.paths = paths
+        self.labels = labels
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, index: int) -> tuple[str, int]:
+        return self.paths[index], int(self.labels[index])
+
+
 class SSFTCollator:
     def __init__(self, processor):
         self.processor = processor
@@ -259,6 +273,54 @@ class SSFTCollator:
         return {"view1": dict(inputs1), "view2": dict(inputs2), "paths": kept_paths}
 
 
+class SingleViewCollator:
+    def __init__(self, processor, augment: bool):
+        self.processor = processor
+        self.augment = augment
+
+    def __call__(self, batch: list[tuple[str, int]]) -> dict[str, Any] | None:
+        images: list[Image.Image] = []
+        labels: list[int] = []
+        kept_paths: list[str] = []
+
+        for image_path, label in batch:
+            image = load_rgb_image(image_path)
+            if image is None:
+                continue
+            images.append(make_ssft_view(image) if self.augment else image)
+            labels.append(int(label))
+            kept_paths.append(image_path)
+
+        if not kept_paths:
+            return None
+
+        inputs = self.processor(images=images, return_tensors="pt")
+        return {
+            "inputs": dict(inputs),
+            "labels": torch.tensor(labels, dtype=torch.long),
+            "paths": kept_paths,
+        }
+
+
+class EncodePathCollator:
+    def __init__(self, processor):
+        self.processor = processor
+
+    def __call__(self, batch: list[str]) -> dict[str, Any] | None:
+        images: list[Image.Image] = []
+        kept_paths: list[str] = []
+        for image_path in batch:
+            image = load_rgb_image(image_path)
+            if image is None:
+                continue
+            images.append(image)
+            kept_paths.append(image_path)
+        if not kept_paths:
+            return None
+        inputs = self.processor(images=images, return_tensors="pt")
+        return {"inputs": dict(inputs), "paths": kept_paths}
+
+
 class ProjectionHead(nn.Module):
     def __init__(self, hidden_size: int, projection_dim: int):
         super().__init__()
@@ -270,6 +332,15 @@ class ProjectionHead(nn.Module):
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         return F.normalize(self.net(features), dim=-1)
+
+
+class ClusterHead(nn.Module):
+    def __init__(self, hidden_size: int, num_clusters: int):
+        super().__init__()
+        self.linear = nn.Linear(hidden_size, num_clusters)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return self.linear(features)
 
 
 def make_ssft_view(image: Image.Image) -> Image.Image:
@@ -323,6 +394,128 @@ def nt_xent_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float) -> torc
     return F.cross_entropy(logits, targets)
 
 
+def vicreg_loss(
+    z1: torch.Tensor,
+    z2: torch.Tensor,
+    sim_coeff: float = 25.0,
+    std_coeff: float = 25.0,
+    cov_coeff: float = 1.0,
+    eps: float = 1e-4,
+) -> torch.Tensor:
+    repr_loss = F.mse_loss(z1, z2)
+
+    z1_centered = z1 - z1.mean(dim=0)
+    z2_centered = z2 - z2.mean(dim=0)
+
+    std_z1 = torch.sqrt(z1_centered.var(dim=0, unbiased=False) + eps)
+    std_z2 = torch.sqrt(z2_centered.var(dim=0, unbiased=False) + eps)
+    std_loss = (F.relu(1.0 - std_z1).mean() + F.relu(1.0 - std_z2).mean())
+
+    n = z1.shape[0]
+    cov_z1 = (z1_centered.T @ z1_centered) / max(n - 1, 1)
+    cov_z2 = (z2_centered.T @ z2_centered) / max(n - 1, 1)
+    off_diag_mask = ~torch.eye(cov_z1.shape[0], device=z1.device, dtype=torch.bool)
+    cov_loss = cov_z1[off_diag_mask].pow(2).mean() + cov_z2[off_diag_mask].pow(2).mean()
+
+    return sim_coeff * repr_loss + std_coeff * std_loss + cov_coeff * cov_loss
+
+
+def compute_ssft_loss(
+    z1: torch.Tensor,
+    z2: torch.Tensor,
+    objective: str,
+    temperature: float,
+) -> torch.Tensor:
+    objective = objective.lower()
+    if objective == "ntxent":
+        return nt_xent_loss(z1, z2, temperature=temperature)
+    if objective == "vicreg":
+        return vicreg_loss(z1, z2)
+    raise ValueError(f"Unsupported SSFT objective={objective}")
+
+
+def infer_deepcluster_cluster_count(num_paths: int, configured_clusters: int | None) -> int:
+    if configured_clusters is not None:
+        return max(2, int(configured_clusters))
+    heuristic = max(32, min(1024, num_paths // 100))
+    return max(2, heuristic)
+
+
+@torch.inference_mode()
+def encode_backbone_features(
+    model: nn.Module,
+    processor,
+    paths: list[str],
+    batch_size: int,
+    num_workers: int,
+    device: torch.device,
+    desc: str,
+) -> tuple[np.ndarray, list[str]]:
+    data_loader = DataLoader(
+        PathDataset(paths),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=EncodePathCollator(processor),
+        pin_memory=torch.cuda.is_available(),
+    )
+    vectors: list[torch.Tensor] = []
+    kept_paths: list[str] = []
+    model.eval()
+    for batch in tqdm(data_loader, desc=desc, leave=False):
+        if batch is None:
+            continue
+        inputs = move_batch_to_device(batch["inputs"], device)
+        features = F.normalize(pooled_output(model(**inputs)).float(), dim=-1)
+        vectors.append(features.cpu())
+        kept_paths.extend(batch["paths"])
+    if not vectors:
+        raise ValueError(f"No valid images were encoded for {desc}")
+    return torch.cat(vectors, dim=0).numpy(), kept_paths
+
+
+def build_deepcluster_assignments(
+    model: nn.Module,
+    processor,
+    train_paths: list[str],
+    val_paths: list[str],
+    cfg: RunConfig,
+    device: torch.device,
+    epoch: int,
+) -> tuple[list[str], np.ndarray, list[str], np.ndarray]:
+    train_features, kept_train_paths = encode_backbone_features(
+        model,
+        processor,
+        train_paths,
+        batch_size=cfg.batch_size,
+        num_workers=cfg.num_workers,
+        device=device,
+        desc=f"deepcluster encode train epoch {epoch}",
+    )
+    num_clusters = infer_deepcluster_cluster_count(len(kept_train_paths), cfg.ssft_deepcluster_clusters)
+    num_clusters = min(num_clusters, len(kept_train_paths))
+    clusterer = KMeans(n_clusters=num_clusters, random_state=cfg.random_seed, n_init="auto")
+    train_labels = clusterer.fit_predict(train_features)
+
+    kept_val_paths: list[str] = []
+    val_labels = np.array([], dtype=np.int64)
+    if val_paths:
+        val_features, kept_val_paths = encode_backbone_features(
+            model,
+            processor,
+            val_paths,
+            batch_size=cfg.batch_size,
+            num_workers=cfg.num_workers,
+            device=device,
+            desc=f"deepcluster encode val epoch {epoch}",
+        )
+        centroids = l2_normalize(clusterer.cluster_centers_.astype(np.float32))
+        val_scores = l2_normalize(val_features.astype(np.float32)) @ centroids.T
+        val_labels = val_scores.argmax(axis=1).astype(np.int64)
+
+    return kept_train_paths, train_labels, kept_val_paths, val_labels
+
+
 def split_paths_for_ssft(
     paths: list[str],
     val_size: float,
@@ -346,6 +539,7 @@ def evaluate_ssft(
     projector: ProjectionHead,
     data_loader: DataLoader,
     device: torch.device,
+    objective: str,
     temperature: float,
 ) -> float:
     model.eval()
@@ -360,8 +554,208 @@ def evaluate_ssft(
         features2 = pooled_output(model(**view2)).float()
         z1 = projector(features1)
         z2 = projector(features2)
-        losses.append(float(nt_xent_loss(z1, z2, temperature=temperature).item()))
+        losses.append(float(compute_ssft_loss(z1, z2, objective=objective, temperature=temperature).item()))
     return float(np.mean(losses)) if losses else float("nan")
+
+
+@torch.inference_mode()
+def evaluate_deepcluster(
+    model: nn.Module,
+    cluster_head: ClusterHead,
+    data_loader: DataLoader,
+    device: torch.device,
+) -> float:
+    model.eval()
+    cluster_head.eval()
+    losses: list[float] = []
+    for batch in data_loader:
+        if batch is None:
+            continue
+        inputs = move_batch_to_device(batch["inputs"], device)
+        labels = batch["labels"].to(device)
+        features = pooled_output(model(**inputs)).float()
+        logits = cluster_head(features)
+        losses.append(float(F.cross_entropy(logits, labels).item()))
+    return float(np.mean(losses)) if losses else float("nan")
+
+
+def build_deepcluster_loader(
+    processor,
+    paths: list[str],
+    labels: np.ndarray,
+    batch_size: int,
+    num_workers: int,
+    shuffle: bool,
+    augment: bool,
+) -> DataLoader:
+    return DataLoader(
+        LabeledPathDataset(paths, labels.tolist()),
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        collate_fn=SingleViewCollator(processor, augment=augment),
+        pin_memory=torch.cuda.is_available(),
+    )
+
+
+def run_deepcluster_ssft(
+    embedder: FrozenImageEmbedder,
+    discovery_paths: list[str],
+    cfg: RunConfig,
+    device: torch.device,
+    run_dir: Path,
+) -> dict[str, Any]:
+    train_paths = discovery_paths
+    val_paths: list[str] = []
+    if cfg.ssft_early_stopping_patience > 0:
+        train_paths, val_paths = split_paths_for_ssft(
+            discovery_paths,
+            val_size=cfg.ssft_val_size,
+            random_seed=cfg.random_seed,
+        )
+        print(f"[ssft-{embedder.kind}] train={len(train_paths)} val={len(val_paths)}")
+
+    num_clusters = infer_deepcluster_cluster_count(len(train_paths), cfg.ssft_deepcluster_clusters)
+    hidden_size = int(embedder.model.config.hidden_size)
+    cluster_head = ClusterHead(hidden_size=hidden_size, num_clusters=num_clusters).to(device)
+    optimizer = AdamW(
+        list(embedder.model.parameters()) + list(cluster_head.parameters()),
+        lr=cfg.ssft_lr,
+        weight_decay=cfg.ssft_weight_decay,
+    )
+    use_amp = device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    history: list[dict[str, float]] = []
+    checkpoint_path = run_dir / f"ssft_{embedder.kind}.pt"
+    best_val_loss = float("inf")
+    best_train_loss = float("inf")
+    best_epoch = 0
+    epochs_without_improvement = 0
+
+    for epoch in range(1, cfg.ssft_epochs + 1):
+        kept_train_paths, train_labels, kept_val_paths, val_labels = build_deepcluster_assignments(
+            embedder.model,
+            embedder.processor,
+            train_paths,
+            val_paths,
+            cfg,
+            device,
+            epoch,
+        )
+        train_loader = build_deepcluster_loader(
+            embedder.processor,
+            kept_train_paths,
+            train_labels,
+            batch_size=cfg.batch_size,
+            num_workers=cfg.num_workers,
+            shuffle=True,
+            augment=True,
+        )
+        val_loader = None
+        if len(kept_val_paths) > 0:
+            val_loader = build_deepcluster_loader(
+                embedder.processor,
+                kept_val_paths,
+                val_labels,
+                batch_size=cfg.batch_size,
+                num_workers=cfg.num_workers,
+                shuffle=False,
+                augment=False,
+            )
+
+        embedder.model.train()
+        cluster_head.train()
+        epoch_losses: list[float] = []
+        for batch in tqdm(train_loader, desc=f"ssft {embedder.kind} epoch {epoch}", leave=False):
+            if batch is None:
+                continue
+            inputs = move_batch_to_device(batch["inputs"], device)
+            labels = batch["labels"].to(device)
+            optimizer.zero_grad(set_to_none=True)
+            amp_context = (
+                torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True)
+                if use_amp
+                else nullcontext()
+            )
+            with amp_context:
+                features = pooled_output(embedder.model(**inputs)).float()
+                logits = cluster_head(features)
+                loss = F.cross_entropy(logits, labels)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            epoch_losses.append(float(loss.item()))
+
+        mean_loss = float(np.mean(epoch_losses)) if epoch_losses else float("nan")
+        val_loss = float("nan")
+        if val_loader is not None:
+            val_loss = evaluate_deepcluster(embedder.model, cluster_head, val_loader, device)
+        history.append(
+            {
+                "epoch": float(epoch),
+                "train_pseudo_ce_loss": mean_loss,
+                "val_pseudo_ce_loss": val_loss,
+                "num_clusters": float(num_clusters),
+            }
+        )
+        print(
+            f"[ssft-{embedder.kind}] epoch={epoch} "
+            f"train_loss={mean_loss:.4f} val_loss={val_loss:.4f} "
+            f"clusters={num_clusters}"
+        )
+
+        should_save = False
+        if val_loader is not None:
+            if val_loss < best_val_loss - cfg.ssft_early_stopping_min_delta:
+                best_val_loss = val_loss
+                best_epoch = epoch
+                epochs_without_improvement = 0
+                should_save = True
+            else:
+                epochs_without_improvement += 1
+        else:
+            if mean_loss < best_train_loss:
+                best_train_loss = mean_loss
+                best_epoch = epoch
+                should_save = True
+
+        if should_save:
+            torch.save(
+                {
+                    "kind": embedder.kind,
+                    "model_id": embedder.model_id,
+                    "ssft_epochs": cfg.ssft_epochs,
+                    "ssft_lr": cfg.ssft_lr,
+                    "ssft_weight_decay": cfg.ssft_weight_decay,
+                    "ssft_objective": cfg.ssft_objective,
+                    "ssft_deepcluster_clusters": num_clusters,
+                    "best_epoch": float(best_epoch),
+                    "best_val_loss": float(best_val_loss) if val_loader is not None else float("nan"),
+                    "history": history,
+                    "model_state_dict": embedder.model.state_dict(),
+                    "cluster_head_state_dict": cluster_head.state_dict(),
+                },
+                checkpoint_path,
+            )
+
+        if val_loader is not None and cfg.ssft_early_stopping_patience > 0:
+            if epochs_without_improvement >= cfg.ssft_early_stopping_patience:
+                print(
+                    f"[ssft-{embedder.kind}] early stopping at epoch={epoch} "
+                    f"(best_epoch={best_epoch}, best_val_loss={best_val_loss:.4f})"
+                )
+                break
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    embedder.model.load_state_dict(checkpoint["model_state_dict"])
+    embedder.model.eval()
+    return {
+        "checkpoint_path": str(checkpoint_path),
+        "history": history,
+        "best_epoch": float(best_epoch) if best_epoch else float("nan"),
+        "best_val_loss": float(best_val_loss) if len(val_paths) > 0 else float("nan"),
+        "num_clusters": float(num_clusters),
+    }
 
 
 def run_ssft(
@@ -373,6 +767,9 @@ def run_ssft(
 ) -> dict[str, Any]:
     if not discovery_paths:
         raise ValueError("SSFT requested, but discovery set is empty.")
+
+    if cfg.ssft_objective == "deepcluster":
+        return run_deepcluster_ssft(embedder, discovery_paths, cfg, device, run_dir)
 
     train_paths = discovery_paths
     val_paths: list[str] = []
@@ -440,7 +837,12 @@ def run_ssft(
                 features2 = pooled_output(embedder.model(**view2)).float()
                 z1 = projector(features1)
                 z2 = projector(features2)
-                loss = nt_xent_loss(z1, z2, temperature=cfg.ssft_temperature)
+                loss = compute_ssft_loss(
+                    z1,
+                    z2,
+                    objective=cfg.ssft_objective,
+                    temperature=cfg.ssft_temperature,
+                )
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -454,6 +856,7 @@ def run_ssft(
                 projector,
                 val_loader,
                 device=device,
+                objective=cfg.ssft_objective,
                 temperature=cfg.ssft_temperature,
             )
             embedder.model.train()
@@ -493,6 +896,7 @@ def run_ssft(
                     "ssft_epochs": cfg.ssft_epochs,
                     "ssft_lr": cfg.ssft_lr,
                     "ssft_weight_decay": cfg.ssft_weight_decay,
+                    "ssft_objective": cfg.ssft_objective,
                     "ssft_temperature": cfg.ssft_temperature,
                     "best_epoch": float(best_epoch),
                     "best_val_loss": float(best_val_loss) if val_loader is not None else float("nan"),
@@ -675,6 +1079,8 @@ def build_run_config(args: argparse.Namespace) -> RunConfig:
         ssft_weight_decay=args.ssft_weight_decay,
         ssft_temperature=args.ssft_temperature,
         ssft_projection_dim=args.ssft_projection_dim,
+        ssft_objective=args.ssft_objective,
+        ssft_deepcluster_clusters=args.ssft_deepcluster_clusters,
         ssft_early_stopping_patience=args.ssft_early_stopping_patience,
         ssft_early_stopping_min_delta=args.ssft_early_stopping_min_delta,
         ssft_val_size=args.ssft_val_size,
@@ -722,6 +1128,18 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ssft-epochs", type=int, default=1)
     parser.add_argument("--ssft-lr", type=float, default=1e-5)
     parser.add_argument("--ssft-weight-decay", type=float, default=1e-4)
+    parser.add_argument(
+        "--ssft-objective",
+        choices=["ntxent", "vicreg", "deepcluster"],
+        default="ntxent",
+        help="Self-supervised objective used during SSFT.",
+    )
+    parser.add_argument(
+        "--ssft-deepcluster-clusters",
+        type=int,
+        default=None,
+        help="Number of pseudo-clusters used when --ssft-objective=deepcluster. Defaults to a heuristic.",
+    )
     parser.add_argument("--ssft-temperature", type=float, default=0.1)
     parser.add_argument("--ssft-projection-dim", type=int, default=256)
     parser.add_argument(
@@ -801,7 +1219,8 @@ def main() -> None:
         ssft_dir.mkdir(parents=True, exist_ok=True)
         print(
             "Running SSFT on discovery images: "
-            f"epochs={cfg.ssft_epochs} lr={cfg.ssft_lr:g} temp={cfg.ssft_temperature:g}"
+            f"objective={cfg.ssft_objective} epochs={cfg.ssft_epochs} "
+            f"lr={cfg.ssft_lr:g} temp={cfg.ssft_temperature:g}"
         )
         ssft_summary = {
             "enabled": True,

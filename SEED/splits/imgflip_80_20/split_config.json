@@ -1,0 +1,44 @@
+{
+  "output_dir": "/Users/huy.suy05./Documents/Projects/To_Meme_or_To_Not_Meme/SEED/splits/imgflip_80_20",
+  "train_parquet": "/Users/huy.suy05./Documents/Projects/To_Meme_or_To_Not_Meme/SEED/splits/imgflip_80_20/train.parquet",
+  "test_parquet": "/Users/huy.suy05./Documents/Projects/To_Meme_or_To_Not_Meme/SEED/splits/imgflip_80_20/test.parquet",
+  "random_seed": 42,
+  "train_size": 0.8,
+  "dataset": {
+    "images_total_after_filtering": 151977,
+    "classes_after_filtering": 2079,
+    "train_images": 121581,
+    "test_images": 30396,
+    "small_class_filtering": {
+      "min_images_required_per_class": 7,
+      "templates_before": 2163,
+      "templates_after": 2079,
+      "templates_removed": 84,
+      "images_before": 152308,
+      "images_after": 151977,
+      "images_removed": 331,
+      "removed_template_examples": {
+        "Over_Your_Head": 6,
+        "Woosh_cat": 6,
+        "Keep_my_wifes_name_out_of_your_mouth": 6,
+        "Pepe_the_King_Prawn": 6,
+        "Youre_going_to_make_me": 6,
+        "A_second_plane_has_just_hit": 6,
+        "Priest_tempted_by_girl": 6,
+        "Scooby_Doo_Unmasking": 6,
+        "Woman_Holding_Kevin_Hart": 6,
+        "Awkward_Olympics": 6,
+        "Modern_Warfare_3": 6,
+        "dont_look_at_them_Ricky": 6,
+        "Babe_Its_4PM_time_for_your": 6,
+        "South_Park_JIzz": 6,
+        "Beyonc__Tiffany_Pollard": 6,
+        "Brian_Wilson_Vs_ZZ_Top": 6,
+        "Skeptical_Swardson": 6,
+        "Why_would_they_do_this": 6,
+        "Get_in_Loser_Were_Going_Shopping": 5,
+        "single_worker_digging_hole": 5
+      }
+    }
+  }
+}

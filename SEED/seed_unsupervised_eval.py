@@ -30,6 +30,8 @@ from transformers import AutoImageProcessor, Dinov2Model, SiglipVisionModel
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 
+from meme_research_eval_utils import finalize_run_timing, load_split_rows, now_iso, summarize_batch_timings
+
 
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".gif"}
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -38,7 +40,9 @@ PROJECT_ROOT = SCRIPT_DIR.parent
 
 @dataclass
 class RunConfig:
-    imgflip_root: Path
+    imgflip_root: Path | None
+    train_parquet: Path | None
+    test_parquet: Path | None
     output_dir: Path
     train_size: float = 0.80
     min_images_per_class: int = 7
@@ -57,6 +61,7 @@ class RunConfig:
     max_images_per_template: int | None = None
     max_unlabeled_images: int | None = None
     use_ssft: bool = False
+    ssft_checkpoint_dir: Path | None = None
     ssft_epochs: int = 1
     ssft_lr: float = 1e-5
     ssft_weight_decay: float = 1e-4
@@ -925,6 +930,35 @@ def run_ssft(
     }
 
 
+def load_existing_ssft_checkpoint(
+    embedder: FrozenImageEmbedder,
+    checkpoint_dir: Path,
+    device: torch.device,
+) -> dict[str, Any]:
+    checkpoint_path = checkpoint_dir / f"ssft_{embedder.kind}.pt"
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(
+            f"Expected SSFT checkpoint for {embedder.kind} at {checkpoint_path}, but it does not exist."
+        )
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state_dict = checkpoint.get("model_state_dict")
+    if state_dict is None:
+        raise KeyError(f"Checkpoint {checkpoint_path} does not contain `model_state_dict`.")
+
+    embedder.model.load_state_dict(state_dict)
+    embedder.model.eval()
+
+    return {
+        "checkpoint_path": str(checkpoint_path),
+        "loaded_existing": True,
+        "ssft_objective": checkpoint.get("ssft_objective"),
+        "best_epoch": float(checkpoint.get("best_epoch", float("nan"))),
+        "best_val_loss": float(checkpoint.get("best_val_loss", float("nan"))),
+        "history": checkpoint.get("history", []),
+    }
+
+
 def align_dataframe(df: pd.DataFrame, kept_paths: list[str]) -> pd.DataFrame:
     path_to_index = {path: idx for idx, path in enumerate(df["image_path"].tolist())}
     return df.iloc[[path_to_index[path] for path in kept_paths]].reset_index(drop=True)
@@ -1040,7 +1074,7 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
     precision, recall, f1, _ = precision_recall_fscore_support(
         y_true,
         y_pred,
-        average="macro",
+        average="weighted",
         zero_division=0,
     )
     return {
@@ -1053,9 +1087,18 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
     }
 
 
+def parse_int_list(text: str) -> tuple[int, ...]:
+    values = [part.strip() for part in text.split(",") if part.strip()]
+    if not values:
+        raise argparse.ArgumentTypeError("Expected at least one integer seed.")
+    return tuple(int(value) for value in values)
+
+
 def build_run_config(args: argparse.Namespace) -> RunConfig:
     return RunConfig(
-        imgflip_root=Path(args.imgflip_root).expanduser().resolve(),
+        imgflip_root=None if args.imgflip_root is None else Path(args.imgflip_root).expanduser().resolve(),
+        train_parquet=None if args.train_parquet is None else Path(args.train_parquet).expanduser().resolve(),
+        test_parquet=None if args.test_parquet is None else Path(args.test_parquet).expanduser().resolve(),
         output_dir=Path(args.output_dir).expanduser().resolve(),
         train_size=args.train_size,
         min_images_per_class=args.min_images_per_class,
@@ -1074,6 +1117,9 @@ def build_run_config(args: argparse.Namespace) -> RunConfig:
         max_images_per_template=args.max_images_per_template,
         max_unlabeled_images=args.max_unlabeled_images,
         use_ssft=args.use_ssft,
+        ssft_checkpoint_dir=(
+            None if args.ssft_checkpoint_dir is None else Path(args.ssft_checkpoint_dir).expanduser().resolve()
+        ),
         ssft_epochs=args.ssft_epochs,
         ssft_lr=args.ssft_lr,
         ssft_weight_decay=args.ssft_weight_decay,
@@ -1095,11 +1141,19 @@ def make_parser() -> argparse.ArgumentParser:
             "then majority-vote cluster naming."
         )
     )
-    parser.add_argument("--imgflip-root", required=True, help="Labeled ImgFlip folder-of-folders root.")
+    parser.add_argument("--imgflip-root", default=None, help="Labeled ImgFlip folder-of-folders root.")
+    parser.add_argument("--train-parquet", default=None, help="Optional fixed train split parquet.")
+    parser.add_argument("--test-parquet", default=None, help="Optional fixed test split parquet.")
     parser.add_argument("--output-dir", default="SEED/runs/seed_unsupervised_eval")
     parser.add_argument("--train-size", type=float, default=0.80)
     parser.add_argument("--min-images-per-class", type=int, default=7)
     parser.add_argument("--random-seed", type=int, default=42)
+    parser.add_argument(
+        "--seeds",
+        type=parse_int_list,
+        default=None,
+        help="Optional comma-separated list of seeds to run in batch mode, e.g. 42,43,44.",
+    )
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--siglip-model-id", default="google/siglip2-base-patch16-224")
@@ -1124,6 +1178,15 @@ def make_parser() -> argparse.ArgumentParser:
         dest="use_ssft",
         action="store_true",
         help="Run self-supervised fine-tuning on the discovery split before clustering.",
+    )
+    parser.add_argument(
+        "--ssft-checkpoint-dir",
+        default=None,
+        help=(
+            "Optional directory containing existing SSFT checkpoints named "
+            "`ssft_siglip.pt` and `ssft_dino.pt`. When provided, the script "
+            "loads these adapted backbones instead of retraining them."
+        ),
     )
     parser.add_argument("--ssft-epochs", type=int, default=1)
     parser.add_argument("--ssft-lr", type=float, default=1e-5)
@@ -1163,37 +1226,43 @@ def make_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
-    args = make_parser().parse_args()
-    cfg = build_run_config(args)
+def run_once(cfg: RunConfig, run_dir: Path) -> dict[str, Any]:
     set_seed(cfg.random_seed)
+    run_started_at = now_iso()
+    start_perf = time.perf_counter()
     device = pick_device()
-
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    run_dir = cfg.output_dir / timestamp
     run_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"device={device}")
     print(f"run_dir={run_dir}")
 
-    imgflip_df = collect_labeled_rows(
-        cfg.imgflip_root,
-        max_templates=cfg.max_templates,
-        max_images_per_template=cfg.max_images_per_template,
-    )
-    imgflip_df = filter_valid_image_rows(imgflip_df)
-    imgflip_df, filtering_summary = drop_small_classes(imgflip_df, cfg.min_images_per_class)
+    train_parquet = getattr(cfg, "train_parquet", None)
+    test_parquet = getattr(cfg, "test_parquet", None)
+    if train_parquet is not None and test_parquet is not None:
+        train_imgflip_df, test_imgflip_df = load_split_rows(str(train_parquet), str(test_parquet))
+        imgflip_df = pd.concat([train_imgflip_df, test_imgflip_df], ignore_index=True)
+        filtering_summary = {"precomputed_split": True}
+    else:
+        if cfg.imgflip_root is None:
+            raise ValueError("Either --imgflip-root or both --train-parquet and --test-parquet must be provided.")
+        imgflip_df = collect_labeled_rows(
+            cfg.imgflip_root,
+            max_templates=cfg.max_templates,
+            max_images_per_template=cfg.max_images_per_template,
+        )
+        imgflip_df = filter_valid_image_rows(imgflip_df)
+        imgflip_df, filtering_summary = drop_small_classes(imgflip_df, cfg.min_images_per_class)
 
-    train_imgflip_df, test_imgflip_df = train_test_split(
-        imgflip_df,
-        train_size=cfg.train_size,
-        stratify=imgflip_df["template"],
-        random_state=cfg.random_seed,
-    )
-    train_imgflip_df = train_imgflip_df.reset_index(drop=True)
-    test_imgflip_df = test_imgflip_df.reset_index(drop=True)
-    train_imgflip_df["source"] = "imgflip_train"
-    test_imgflip_df["source"] = "imgflip_test"
+        train_imgflip_df, test_imgflip_df = train_test_split(
+            imgflip_df,
+            train_size=cfg.train_size,
+            stratify=imgflip_df["template"],
+            random_state=cfg.random_seed,
+        )
+        train_imgflip_df = train_imgflip_df.reset_index(drop=True)
+        test_imgflip_df = test_imgflip_df.reset_index(drop=True)
+        train_imgflip_df["source"] = "imgflip_train"
+        test_imgflip_df["source"] = "imgflip_test"
 
     train_imgflip_df, unlabeled_imgflip_df = split_labeled_and_unlabeled_from_train(
         train_imgflip_df,
@@ -1214,7 +1283,17 @@ def main() -> None:
     test_paths = test_imgflip_df["image_path"].tolist()
     ssft_summary: dict[str, Any] | None = None
 
-    if cfg.use_ssft:
+    if cfg.ssft_checkpoint_dir is not None:
+        print(f"Loading existing SSFT checkpoints from {cfg.ssft_checkpoint_dir}")
+        ssft_summary = {
+            "enabled": True,
+            "loaded_existing": True,
+            "discovery_images": int(len(discovery_paths)),
+            "checkpoint_dir": str(cfg.ssft_checkpoint_dir),
+            "siglip": load_existing_ssft_checkpoint(siglip, cfg.ssft_checkpoint_dir, device),
+            "dino": load_existing_ssft_checkpoint(dino, cfg.ssft_checkpoint_dir, device),
+        }
+    elif cfg.use_ssft:
         ssft_dir = run_dir / "ssft"
         ssft_dir.mkdir(parents=True, exist_ok=True)
         print(
@@ -1224,12 +1303,13 @@ def main() -> None:
         )
         ssft_summary = {
             "enabled": True,
+            "loaded_existing": False,
             "discovery_images": int(len(discovery_paths)),
             "siglip": run_ssft(siglip, discovery_paths, cfg, device, ssft_dir),
             "dino": run_ssft(dino, discovery_paths, cfg, device, ssft_dir),
         }
     else:
-        ssft_summary = {"enabled": False}
+        ssft_summary = {"enabled": False, "loaded_existing": False}
 
     discovery_siglip, kept_discovery_siglip = siglip.encode_paths(discovery_paths, desc="encode discovery siglip")
     discovery_dino, kept_discovery_dino = dino.encode_paths(discovery_paths, desc="encode discovery dino")
@@ -1282,7 +1362,9 @@ def main() -> None:
     run_metadata = {
         "config": {
             **asdict(cfg),
-            "imgflip_root": str(cfg.imgflip_root),
+            "imgflip_root": None if cfg.imgflip_root is None else str(cfg.imgflip_root),
+            "train_parquet": None if cfg.train_parquet is None else str(cfg.train_parquet),
+            "test_parquet": None if cfg.test_parquet is None else str(cfg.test_parquet),
             "output_dir": str(cfg.output_dir),
             "device": str(device),
         },
@@ -1305,7 +1387,39 @@ def main() -> None:
         "ssft": ssft_summary,
         "test_metrics": metrics,
     }
+    test_metrics_payload = {
+        "test_metrics": metrics,
+        "ssft": ssft_summary,
+        "run_dir": str(run_dir),
+        "cluster_method": cfg.cluster_method,
+        "reducer": cfg.reducer,
+        "alpha": cfg.alpha,
+    }
+    summary_row = {
+        "run_dir": str(run_dir),
+        "seed": int(cfg.random_seed),
+        "ssft_enabled": bool(ssft_summary.get("enabled", False)) if isinstance(ssft_summary, dict) else False,
+        "loaded_existing_ssft": bool(ssft_summary.get("loaded_existing", False)) if isinstance(ssft_summary, dict) else False,
+        "cluster_method": cfg.cluster_method,
+        "reducer": cfg.reducer,
+        "alpha": cfg.alpha,
+        "train_images": int(len(train_imgflip_df)),
+        "test_images": int(len(test_imgflip_df)),
+        "discovery_images_total": int(len(discovery_df)),
+        "discovered_cluster_count": int(len(centroid_ids)),
+        "mapped_cluster_count": int(len(cluster_to_template)),
+        "accuracy": float(metrics["accuracy"]),
+        "precision": float(metrics["precision"]),
+        "recall": float(metrics["recall"]),
+        "f1": float(metrics["f1"]),
+        "mcc": float(metrics["mcc"]),
+        "cohen_kappa": float(metrics["cohen_kappa"]),
+    }
+    timing = finalize_run_timing(run_metadata, summary_row, run_started_at, start_perf)
+    test_metrics_payload["timing"] = timing
     (run_dir / "run_config.json").write_text(json.dumps(run_metadata, indent=2))
+    (run_dir / "test_metrics.json").write_text(json.dumps(test_metrics_payload, indent=2))
+    pd.DataFrame([summary_row]).to_csv(run_dir / "metrics_summary.csv", index=False)
 
     print(f"imgflip_train_images={len(train_imgflip_df)} imgflip_test_images={len(test_imgflip_df)}")
     print(f"discovery_images_total={len(discovery_df)}")
@@ -1316,7 +1430,48 @@ def main() -> None:
     print(f"test_recall={metrics['recall']:.4f}")
     print(f"test_mcc={metrics['mcc']:.4f}")
     print(f"test_cohen_kappa={metrics['cohen_kappa']:.4f}")
+    print(f"duration_seconds={timing['duration_seconds']:.3f}")
     print(f"predictions_saved={run_dir / 'test_predictions.csv'}")
+    return summary_row
+
+
+def main() -> None:
+    args = make_parser().parse_args()
+    cfg = build_run_config(args)
+    seed_values = args.seeds if args.seeds is not None else (cfg.random_seed,)
+
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    if len(seed_values) == 1:
+        single_cfg = RunConfig(**{**asdict(cfg), "random_seed": int(seed_values[0])})
+        run_dir = cfg.output_dir / timestamp
+        run_once(single_cfg, run_dir)
+        return
+
+    batch_dir = cfg.output_dir / f"{timestamp}_batch"
+    batch_dir.mkdir(parents=True, exist_ok=True)
+    batch_rows: list[dict[str, Any]] = []
+
+    for seed in seed_values:
+        print(f"\n=== Running seed {seed} ===")
+        seed_cfg = RunConfig(**{**asdict(cfg), "random_seed": int(seed)})
+        seed_run_dir = batch_dir / f"seed_{int(seed)}"
+        batch_rows.append(run_once(seed_cfg, seed_run_dir))
+
+    batch_timing = summarize_batch_timings(batch_rows)
+    pd.DataFrame(batch_rows).to_csv(batch_dir / "batch_metrics_summary.csv", index=False)
+    (batch_dir / "batch_config.json").write_text(
+        json.dumps(
+            {
+                "output_dir": str(cfg.output_dir),
+                "batch_dir": str(batch_dir),
+                "seeds": [int(seed) for seed in seed_values],
+                "timing": batch_timing,
+            },
+            indent=2,
+        )
+    )
+    print(f"average_duration_seconds={batch_timing['average_duration_seconds']:.3f}")
+    print(f"\nbatch_summary_saved={batch_dir / 'batch_metrics_summary.csv'}")
 
 
 if __name__ == "__main__":

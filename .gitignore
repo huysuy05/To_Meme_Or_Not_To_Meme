@@ -23,3 +23,13 @@ SEED/ground_truth_appended_images.csv
 SEED/embedding_cache
 SEED/models/
 SEED/runs/
+SEED/uns_runs/
+meme-research/
+SEED/results
+SEED/model_checkpoint/
+meme_Gemini/
+EDA_global.ipynb
+EDA_local.ipynb
+analysis/cache/q2_cardiff_affect
+meme_modeling.ipynb
+final_report.tex

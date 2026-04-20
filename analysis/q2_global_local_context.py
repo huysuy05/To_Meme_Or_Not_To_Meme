@@ -2,32 +2,42 @@
 from __future__ import annotations
 
 import argparse
+import colorsys
 import hashlib
-import json
 import math
 import re
 from pathlib import Path
 from typing import Any
 
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from sklearn.decomposition import NMF
-from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 from common import (
     add_sentiment_layers,
+    build_current_data_bundle_raw,
+    build_text,
     configure_plot_style,
     ensure_dir,
-    load_analysis_dataframe,
     try_import_sentence_transformers,
     write_run_metadata,
     write_summary_markdown,
 )
 
+try:
+    from wordcloud import WordCloud
+except Exception:
+    WordCloud = None
+
+try:
+    from wordcloud import STOPWORDS as WORDCLOUD_STOPWORDS
+except Exception:
+    WORDCLOUD_STOPWORDS = set()
+
 
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9']+")
-PHASE_ORDER = ["early", "peak", "mature", "decline", "tail"]
 NOTEBOOK_EMOTION_LABELS = [
     "joy",
     "anticipation",
@@ -43,53 +53,158 @@ NOTEBOOK_EMOTION_LABELS = [
 ]
 NOTEBOOK_SENTIMENT_LABELS = ["neutral", "positive", "negative"]
 ALL_AFFECT_LABELS = NOTEBOOK_EMOTION_LABELS + NOTEBOOK_SENTIMENT_LABELS
+LABEL_COLORS = {
+    "joy": "#ffb703",
+    "anticipation": "#8ecae6",
+    "disgust": "#2a9d8f",
+    "sadness": "#4361ee",
+    "anger": "#e63946",
+    "optimism": "#f4a261",
+    "surprise": "#9b5de5",
+    "pessimism": "#577590",
+    "fear": "#6d597a",
+    "trust": "#43aa8b",
+    "love": "#f15bb5",
+    "neutral": "#8d99ae",
+    "positive": "#06d6a0",
+    "negative": "#d62828",
+}
+CONTEXT_COLORS = {
+    "global": "#3a86ff",
+    "local": "#ff006e",
+}
+DEFAULT_STOPWORDS = {
+    *{str(value).lower() for value in WORDCLOUD_STOPWORDS},
+    "the",
+    "and",
+    "for",
+    "that",
+    "this",
+    "with",
+    "from",
+    "have",
+    "your",
+    "they",
+    "them",
+    "then",
+    "than",
+    "into",
+    "about",
+    "when",
+    "what",
+    "would",
+    "could",
+    "should",
+    "there",
+    "their",
+    "it's",
+    "dont",
+    "doesnt",
+    "didnt",
+    "cant",
+    "wont",
+    "youre",
+    "thats",
+    "image",
+    "images",
+    "meme",
+    "memes",
+    "text",
+    "caption",
+    "captions",
+    "context",
+    "global",
+    "local",
+    "description",
+    "describes",
+    "described",
+    "depicts",
+    "depicted",
+    "depicts",
+    "shows",
+    "showing",
+    "shown",
+    "panel",
+    "panels",
+    "top",
+    "bottom",
+    "left",
+    "right",
+    "middle",
+    "character",
+    "characters",
+    "person",
+    "people",
+    "someone",
+    "thing",
+    "things",
+    "one",
+    "two",
+    "three",
+    "humor",
+    "humorous",
+    "humorously",
+    "joke",
+    "jokes",
+    "suggest",
+    "suggests",
+    "suggesting",
+    "suggested",
+    "imply",
+    "implies",
+    "implying",
+    "implied",
+    "using",
+    "used",
+    "uses",
+    "title",
+    "body",
+    "post",
+    "posts",
+    "user",
+    "users",
+    "reddit",
+    "scene",
+    "format",
+    "template",
+    "reaction",
+    "common",
+    "perceived",
+}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Research Question 2: paired global/local context analysis with sentiment mismatch, "
-            "semantic alignment, topic transitions, lifecycle phases, keyword summaries, local complexity, "
-            "and normalized temporal analyses."
+            "Research Question 2: generate paired global/local affect charts for score distributions, "
+            "dominant-label proportions, dominant-score summaries, and per-label word clouds."
         )
     )
     parser.add_argument("--analysis-parquet", required=True)
     parser.add_argument("--results-dir", default="analysis/results/q2_global_local_context")
-    parser.add_argument("--template-ranking", choices=["count", "score"], default="count")
-    parser.add_argument("--top-k-templates", type=int, default=10)
-    parser.add_argument("--min-template-posts", type=int, default=50)
-    parser.add_argument("--monthly-min-posts", type=int, default=30)
-    parser.add_argument("--rolling-months", type=int, default=3)
-    parser.add_argument("--lifecycle-freq", default="M")
-    parser.add_argument("--low-frac", type=float, default=0.25)
-    parser.add_argument("--sustain-periods", type=int, default=3)
-    parser.add_argument("--zero-run-periods", type=int, default=4)
-    parser.add_argument("--alignment-backend", choices=["auto", "tfidf", "sbert"], default="auto")
-    parser.add_argument("--sbert-model", default="sentence-transformers/all-MiniLM-L6-v2")
-    parser.add_argument("--alignment-max-features", type=int, default=10000)
     parser.add_argument("--emotion-backend", choices=["cardiff", "vader"], default="cardiff")
     parser.add_argument("--emotion-cache-dir", default="analysis/cache/q2_cardiff_affect")
     parser.add_argument("--emotion-batch-size", type=int, default=32)
     parser.add_argument("--emotion-max-length", type=int, default=512)
     parser.add_argument("--emotion-threshold", type=float, default=0.7)
-    parser.add_argument("--emotion-top-n", type=int, default=7)
+    parser.add_argument("--hist-bins", type=int, default=28)
+    parser.add_argument("--dominant-top-n", type=int, default=3)
+    parser.add_argument("--wordcloud-max-words", type=int, default=150)
+    parser.add_argument("--wordcloud-min-token-len", type=int, default=3)
+    parser.add_argument("--keyword-backend", choices=["auto", "sbert", "tfidf"], default="auto")
+    parser.add_argument("--keyword-embedding-model", default="sentence-transformers/all-MiniLM-L6-v2")
+    parser.add_argument("--keyword-max-docs-per-class", type=int, default=5000)
     parser.add_argument("--max-rows", type=int, default=0)
-    parser.add_argument("--topic-model", choices=["bertopic", "nmf"], default="bertopic")
-    parser.add_argument("--topic-embedding-model", default="sentence-transformers/all-mpnet-base-v2")
-    parser.add_argument("--bertopic-batch-size", type=int, default=128)
-    parser.add_argument("--n-topics", type=int, default=12)
-    parser.add_argument("--topic-max-features", type=int, default=6000)
-    parser.add_argument("--topic-min-df", type=int, default=10)
-    parser.add_argument("--max-topic-docs-fit", type=int, default=60000)
-    parser.add_argument("--keyword-top-n", type=int, default=12)
     parser.add_argument("--random-seed", type=int, default=42)
     return parser.parse_args()
 
 
-def _normalize_freq(freq: str) -> str:
-    if str(freq).upper() == "M":
-        return "MS"
-    return freq
+def _text_hash(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _normalize_context_name(context: str) -> str:
+    return str(context).strip().lower()
 
 
 def _tokenize(text: str) -> list[str]:
@@ -98,8 +213,54 @@ def _tokenize(text: str) -> list[str]:
     return TOKEN_PATTERN.findall(text.lower())
 
 
-def _text_hash(text: str) -> str:
-    return hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
+def _safe_dominant_from_columns(frame: pd.DataFrame, suffix_to_strip: str) -> tuple[pd.Series, pd.Series]:
+    numeric = frame.apply(pd.to_numeric, errors="coerce")
+    all_na = numeric.isna().all(axis=1)
+    labels = numeric.fillna(-np.inf).idxmax(axis=1).str.replace(suffix_to_strip, "", regex=False)
+    scores = numeric.max(axis=1, skipna=True)
+    labels = labels.mask(all_na, "unavailable")
+    scores = scores.mask(all_na, np.nan)
+    return labels, scores
+
+
+def _lighten_color(color: str, amount: float) -> tuple[float, float, float]:
+    r, g, b = mcolors.to_rgb(color)
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    l = 1 - (1 - l) * (1 - amount)
+    return colorsys.hls_to_rgb(h, l, s)
+
+
+def _build_wordcloud_color_func(base_color: str):
+    base_rgb = np.array(mcolors.to_rgb(base_color))
+
+    def color_func(
+        word: str,
+        font_size: int,
+        position: tuple[int, int],
+        orientation: int | None,
+        random_state: Any | None = None,
+        **kwargs: Any,
+    ) -> str:
+        rng = random_state if random_state is not None else np.random
+        mix = 0.2 + 0.55 * float(rng.random())
+        rgb = base_rgb * (1 - mix) + np.ones(3) * mix
+        return mcolors.to_hex(np.clip(rgb, 0, 1))
+
+    return color_func
+
+
+def _theme_plot(figsize: tuple[float, float]) -> tuple[plt.Figure, plt.Axes]:
+    configure_plot_style()
+    plt.rcParams.update(
+        {
+            "axes.facecolor": "#f7f9fc",
+            "figure.facecolor": "#ffffff",
+            "grid.color": "#d5deed",
+            "grid.alpha": 0.45,
+        }
+    )
+    fig, ax = plt.subplots(figsize=figsize)
+    return fig, ax
 
 
 def add_cardiff_affect_layers(
@@ -157,6 +318,8 @@ def add_cardiff_affect_layers(
         device: int | str = -1
         if torch.cuda.is_available():
             device = 0
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "mps"
 
         emotion_model_name = "cardiffnlp/twitter-roberta-base-emotion-multilabel-latest"
         sentiment_model_name = "cardiffnlp/twitter-roberta-base-sentiment-latest"
@@ -244,18 +407,10 @@ def add_cardiff_affect_layers(
     global_sentiment_cols = [f"{label}_global" for label in NOTEBOOK_SENTIMENT_LABELS]
     local_sentiment_cols = [f"{label}_local" for label in NOTEBOOK_SENTIMENT_LABELS]
 
-    enriched["global_dominant_emotion"] = (
-        enriched[global_emotion_cols].idxmax(axis=1).str.replace("_global", "", regex=False)
-    )
-    enriched["local_dominant_emotion"] = (
-        enriched[local_emotion_cols].idxmax(axis=1).str.replace("_local", "", regex=False)
-    )
-    enriched["global_sentiment_label"] = (
-        enriched[global_sentiment_cols].idxmax(axis=1).str.replace("_global", "", regex=False)
-    )
-    enriched["local_sentiment_label"] = (
-        enriched[local_sentiment_cols].idxmax(axis=1).str.replace("_local", "", regex=False)
-    )
+    enriched["global_dominant_emotion"], _ = _safe_dominant_from_columns(enriched[global_emotion_cols], "_global")
+    enriched["local_dominant_emotion"], _ = _safe_dominant_from_columns(enriched[local_emotion_cols], "_local")
+    enriched["global_sentiment_label"], _ = _safe_dominant_from_columns(enriched[global_sentiment_cols], "_global")
+    enriched["local_sentiment_label"], _ = _safe_dominant_from_columns(enriched[local_sentiment_cols], "_local")
     enriched["global_sentiment_score"] = enriched["positive_global"].fillna(0.0) - enriched["negative_global"].fillna(0.0)
     enriched["local_sentiment_score"] = enriched["positive_local"].fillna(0.0) - enriched["negative_local"].fillna(0.0)
     enriched["emotion_mismatch"] = (
@@ -270,6 +425,19 @@ def add_cardiff_affect_layers(
 
 def add_affect_layers(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
     if args.emotion_backend == "cardiff":
+        if _has_any_precomputed_cardiff(df):
+            enriched = _finalize_precomputed_cardiff(df)
+            missing_mask = enriched["positive_global"].isna() | enriched["positive_local"].isna()
+            if bool(missing_mask.any()):
+                computed_missing = add_cardiff_affect_layers(
+                    df.loc[missing_mask].copy(),
+                    cache_dir=args.emotion_cache_dir,
+                    batch_size=args.emotion_batch_size,
+                    max_length=args.emotion_max_length,
+                )
+                for column in computed_missing.columns:
+                    enriched.loc[missing_mask, column] = computed_missing[column].to_numpy()
+            return enriched
         return add_cardiff_affect_layers(
             df,
             cache_dir=args.emotion_cache_dir,
@@ -277,1264 +445,734 @@ def add_affect_layers(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFram
             max_length=args.emotion_max_length,
         )
     enriched = add_sentiment_layers(df)
+    for label in NOTEBOOK_SENTIMENT_LABELS:
+        enriched[f"{label}_global"] = np.where(enriched["global_sentiment_label"].eq(label), 1.0, 0.0)
+        enriched[f"{label}_local"] = np.where(enriched["local_sentiment_label"].eq(label), 1.0, 0.0)
+    for label in NOTEBOOK_EMOTION_LABELS:
+        enriched[f"{label}_global"] = np.nan
+        enriched[f"{label}_local"] = np.nan
     enriched["global_dominant_emotion"] = enriched["global_sentiment_label"]
     enriched["local_dominant_emotion"] = enriched["local_sentiment_label"]
     enriched["emotion_mismatch"] = enriched["sentiment_mismatch"]
     return enriched
 
 
-def add_local_complexity_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    local_tokens = df["local_text"].map(_tokenize)
-    global_tokens = df["global_text"].map(_tokenize)
-    df["local_char_len"] = df["local_text"].astype(str).str.len()
-    df["local_token_len"] = local_tokens.map(len)
-    df["global_token_len"] = global_tokens.map(len)
-    df["user_text_segments"] = df["user_text_list"].map(len)
-    df["local_keyword_count"] = df["local_keywords_list"].map(len)
-    df["global_keyword_count"] = df["global_keywords_list"].map(len)
-    df["local_unique_tokens"] = local_tokens.map(lambda values: len(set(values)))
-    df["global_unique_tokens"] = global_tokens.map(lambda values: len(set(values)))
-    df["local_lexical_diversity"] = df["local_unique_tokens"] / df["local_token_len"].clip(lower=1)
-    df["global_lexical_diversity"] = df["global_unique_tokens"] / df["global_token_len"].clip(lower=1)
-    complexity_cols = [
-        "local_char_len",
-        "local_token_len",
-        "user_text_segments",
-        "local_keyword_count",
-        "local_lexical_diversity",
+def _has_any_precomputed_cardiff(df: pd.DataFrame) -> bool:
+    required = [
+        "positive_global",
+        "negative_global",
+        "neutral_global",
+        "positive_local",
+        "negative_local",
+        "neutral_local",
     ]
-    for column in complexity_cols:
-        values = pd.to_numeric(df[column], errors="coerce")
-        std = float(values.std(ddof=0))
-        if std == 0 or np.isnan(std):
-            df[f"{column}_z"] = 0.0
-        else:
-            df[f"{column}_z"] = (values - float(values.mean())) / std
-    z_cols = [f"{column}_z" for column in complexity_cols]
-    df["local_complexity_index"] = df[z_cols].mean(axis=1)
-    return df
+    return all(column in df.columns for column in required)
 
 
-def compute_alignment(df: pd.DataFrame, backend: str, sbert_model: str, max_features: int) -> pd.DataFrame:
-    df = df.copy()
-    mask = df["global_text"].astype(str).str.strip().ne("") & df["local_text"].astype(str).str.strip().ne("")
-    df["global_local_similarity"] = np.nan
-    df["alignment_backend"] = "none"
-    if not mask.any():
-        return df
-
-    subset = df.loc[mask, ["global_text", "local_text"]].copy()
-    if backend in {"auto", "sbert"}:
-        sentence_transformer_cls = try_import_sentence_transformers()
-        if sentence_transformer_cls is not None:
-            model = sentence_transformer_cls(sbert_model)
-            global_emb = np.asarray(
-                model.encode(subset["global_text"].tolist(), show_progress_bar=False, normalize_embeddings=True),
-                dtype=np.float32,
-            )
-            local_emb = np.asarray(
-                model.encode(subset["local_text"].tolist(), show_progress_bar=False, normalize_embeddings=True),
-                dtype=np.float32,
-            )
-            similarity = (global_emb * local_emb).sum(axis=1)
-            df.loc[mask, "global_local_similarity"] = similarity
-            df["alignment_backend"] = "sbert"
-            return df
-        if backend == "sbert":
-            raise RuntimeError("sentence-transformers is unavailable for --alignment-backend=sbert")
-
-    vectorizer = TfidfVectorizer(stop_words="english", min_df=5, max_features=max_features)
-    combined_corpus = pd.concat([subset["global_text"], subset["local_text"]], ignore_index=True).tolist()
-    matrix = vectorizer.fit_transform(combined_corpus)
-    midpoint = len(subset)
-    global_matrix = matrix[:midpoint]
-    local_matrix = matrix[midpoint:]
-    similarity = global_matrix.multiply(local_matrix).sum(axis=1).A1
-    df.loc[mask, "global_local_similarity"] = similarity
-    df["alignment_backend"] = "tfidf"
-    return df
-
-
-def select_top_templates(df: pd.DataFrame, ranking: str, top_k: int, min_posts: int) -> pd.DataFrame:
-    group = (
-        df.groupby("template_final", observed=True)
-        .agg(
-            total_posts=("template_final", "size"),
-            mean_score=("score", "mean"),
-            mean_alignment=("global_local_similarity", "mean"),
-        )
-        .reset_index()
-    )
-    group = group[group["total_posts"] >= min_posts].copy()
-    if ranking == "score":
-        group = group.sort_values(["mean_score", "total_posts"], ascending=[False, False]).reset_index(drop=True)
-    else:
-        group = group.sort_values(["total_posts", "mean_score"], ascending=[False, False]).reset_index(drop=True)
-    selected = group.head(top_k).copy()
-    selected["template_rank"] = range(1, len(selected) + 1)
-    return selected
-
-
-def compute_paired_sentiment_outputs(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    pair_counts = (
-        df.groupby(["global_sentiment_label", "local_sentiment_label"], observed=True)
-        .size()
-        .rename("count")
-        .reset_index()
-    )
-    pair_matrix = (
-        pair_counts.pivot(index="global_sentiment_label", columns="local_sentiment_label", values="count")
-        .fillna(0)
-        .astype(int)
-    )
-    row_totals = pair_matrix.sum(axis=1).replace(0, np.nan)
-    normalized = pair_matrix.div(row_totals, axis=0).fillna(0.0)
-    return pair_matrix, normalized
-
-
-def compute_paired_emotion_outputs(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    pair_counts = (
-        df.groupby(["global_dominant_emotion", "local_dominant_emotion"], observed=True)
-        .size()
-        .rename("count")
-        .reset_index()
-    )
-    if pair_counts.empty:
-        return pd.DataFrame(), pd.DataFrame()
-    pair_matrix = (
-        pair_counts.pivot(index="global_dominant_emotion", columns="local_dominant_emotion", values="count")
-        .fillna(0)
-        .astype(int)
-    )
-    row_totals = pair_matrix.sum(axis=1).replace(0, np.nan)
-    normalized = pair_matrix.div(row_totals, axis=0).fillna(0.0)
-    return pair_matrix, normalized
-
-
-def compute_dominant_affect_counts(df: pd.DataFrame, column: str) -> pd.DataFrame:
-    if column not in df.columns:
-        return pd.DataFrame()
-    counts = df[column].fillna("unavailable").astype(str).value_counts().rename_axis("label").reset_index(name="count")
-    counts["share"] = counts["count"] / counts["count"].sum()
-    return counts
-
-
-def compute_threshold_proportions(df: pd.DataFrame, suffix: str, threshold: float) -> pd.DataFrame:
-    rows: list[dict[str, Any]] = []
-    total = max(len(df), 1)
+def _finalize_precomputed_cardiff(df: pd.DataFrame) -> pd.DataFrame:
+    enriched = df.copy()
     for label in ALL_AFFECT_LABELS:
-        column = f"{label}_{suffix}"
-        if column not in df.columns:
-            continue
-        share = float(pd.to_numeric(df[column], errors="coerce").gt(threshold).mean())
-        rows.append({"label": label, "share": share, "count": int(round(share * total))})
-    return pd.DataFrame(rows).sort_values("share", ascending=False)
+        for suffix in ["global", "local"]:
+            column = f"{label}_{suffix}"
+            if column not in enriched.columns:
+                enriched[column] = np.nan
+            enriched[column] = pd.to_numeric(enriched[column], errors="coerce")
+
+    global_emotion_cols = [f"{label}_global" for label in ALL_AFFECT_LABELS]
+    local_emotion_cols = [f"{label}_local" for label in ALL_AFFECT_LABELS]
+    global_sentiment_cols = [f"{label}_global" for label in NOTEBOOK_SENTIMENT_LABELS]
+    local_sentiment_cols = [f"{label}_local" for label in NOTEBOOK_SENTIMENT_LABELS]
+
+    enriched["global_dominant_emotion"], _ = _safe_dominant_from_columns(enriched[global_emotion_cols], "_global")
+    enriched["local_dominant_emotion"], _ = _safe_dominant_from_columns(enriched[local_emotion_cols], "_local")
+    enriched["global_sentiment_label"], _ = _safe_dominant_from_columns(enriched[global_sentiment_cols], "_global")
+    enriched["local_sentiment_label"], _ = _safe_dominant_from_columns(enriched[local_sentiment_cols], "_local")
+    enriched["global_sentiment_score"] = enriched["positive_global"].fillna(0.0) - enriched["negative_global"].fillna(0.0)
+    enriched["local_sentiment_score"] = enriched["positive_local"].fillna(0.0) - enriched["negative_local"].fillna(0.0)
+    enriched["emotion_mismatch"] = (
+        enriched["global_dominant_emotion"].astype(str) != enriched["local_dominant_emotion"].astype(str)
+    ).astype(float)
+    enriched["sentiment_mismatch"] = (
+        enriched["global_sentiment_label"].astype(str) != enriched["local_sentiment_label"].astype(str)
+    ).astype(float)
+    enriched["sentiment_backend"] = "cardiff_precomputed"
+    return enriched
 
 
-def compute_monthly_affect_trends(
-    df: pd.DataFrame,
-    suffix: str,
-    threshold: float,
-    top_n: int,
-) -> pd.DataFrame:
-    available_cols = [f"{label}_{suffix}" for label in ALL_AFFECT_LABELS if f"{label}_{suffix}" in df.columns]
-    if not available_cols:
-        return pd.DataFrame()
-    monthly_total = df.groupby("year_month", observed=True).size().rename("posts").reset_index()
-    threshold_counts = (
-        df.groupby("year_month", observed=True)[available_cols]
-        .agg(lambda series: series.gt(threshold).sum())
-        .reset_index()
+def compute_dominant_affect(df: pd.DataFrame, context: str) -> pd.DataFrame:
+    suffix = _normalize_context_name(context)
+    score_columns = [f"{label}_{suffix}" for label in ALL_AFFECT_LABELS if f"{label}_{suffix}" in df.columns]
+    if not score_columns:
+        return pd.DataFrame(columns=["dominant_label", "dominant_score", "text"])
+
+    working = df.copy()
+    working["dominant_label"], working["dominant_score"] = _safe_dominant_from_columns(
+        working[score_columns],
+        f"_{suffix}",
     )
-    monthly = threshold_counts.merge(monthly_total, on="year_month", how="left")
-    for column in available_cols:
-        monthly[f"{column}_normalized"] = pd.to_numeric(monthly[column], errors="coerce") / monthly["posts"].replace(0, np.nan)
-    monthly["month_start"] = pd.PeriodIndex(monthly["year_month"], freq="M").to_timestamp()
-    label_strength = [
-        (
-            label,
-            float(monthly.get(f"{label}_{suffix}_normalized", pd.Series(dtype=float)).mean())
-            if f"{label}_{suffix}_normalized" in monthly.columns
-            else float("nan"),
-        )
-        for label in ALL_AFFECT_LABELS
-    ]
-    selected_labels = [label for label, _ in sorted(label_strength, key=lambda item: item[1], reverse=True)[:top_n]]
-    keep_columns = ["year_month", "month_start", "posts"]
-    for label in selected_labels:
-        keep_columns.extend([f"{label}_{suffix}", f"{label}_{suffix}_normalized"])
-    return monthly.loc[:, [column for column in keep_columns if column in monthly.columns]]
-
-
-def save_count_bar_chart(
-    summary_df: pd.DataFrame,
-    outpath: Path,
-    title: str,
-    ylabel: str,
-    color: str,
-) -> None:
-    if summary_df.empty:
-        return
-    plot_df = summary_df.copy()
-    configure_plot_style()
-    fig, ax = plt.subplots(figsize=(11, 5.5))
-    ax.bar(plot_df["label"], plot_df["count"], color=color, alpha=0.9)
-    ax.set_title(title)
-    ax.set_xlabel("Label")
-    ax.set_ylabel(ylabel)
-    ax.tick_params(axis="x", rotation=45)
-    fig.tight_layout()
-    fig.savefig(outpath, dpi=180)
-    plt.close(fig)
-
-
-def save_share_bar_chart(
-    summary_df: pd.DataFrame,
-    outpath: Path,
-    title: str,
-    ylabel: str,
-    color: str,
-) -> None:
-    if summary_df.empty:
-        return
-    plot_df = summary_df.copy()
-    configure_plot_style()
-    fig, ax = plt.subplots(figsize=(11, 5.5))
-    ax.bar(plot_df["label"], plot_df["share"], color=color, alpha=0.9)
-    ax.set_title(title)
-    ax.set_xlabel("Label")
-    ax.set_ylabel(ylabel)
-    ax.tick_params(axis="x", rotation=45)
-    fig.tight_layout()
-    fig.savefig(outpath, dpi=180)
-    plt.close(fig)
-
-
-def save_monthly_affect_plot(monthly_df: pd.DataFrame, suffix: str, outpath: Path, title: str) -> None:
-    normalized_cols = [column for column in monthly_df.columns if column.endswith(f"_{suffix}_normalized")]
-    if monthly_df.empty or not normalized_cols:
-        return
-    configure_plot_style()
-    fig, ax = plt.subplots(figsize=(13, 6))
-    for column in normalized_cols:
-        label = column[: -(len(f"_{suffix}_normalized"))]
-        ax.plot(monthly_df["month_start"], monthly_df[column], marker="o", linewidth=1.6, label=label)
-    ax.set_title(title)
-    ax.set_xlabel("Month")
-    ax.set_ylabel("Normalized Share of Posts")
-    ax.legend(loc="upper left", fontsize=8, ncol=2)
-    ax.grid(alpha=0.25)
-    fig.autofmt_xdate()
-    fig.tight_layout()
-    fig.savefig(outpath, dpi=180)
-    plt.close(fig)
-
-
-def save_heatmap(
-    matrix_df: pd.DataFrame,
-    outpath: Path,
-    title: str,
-    cmap: str = "Blues",
-    annotate: bool = True,
-) -> None:
-    if matrix_df.empty:
-        return
-    configure_plot_style()
-    fig, ax = plt.subplots(figsize=(8, 6))
-    values = matrix_df.to_numpy(dtype=float)
-    im = ax.imshow(values, cmap=cmap, aspect="auto")
-    ax.set_xticks(range(len(matrix_df.columns)))
-    ax.set_xticklabels(matrix_df.columns.tolist(), rotation=45, ha="right")
-    ax.set_yticks(range(len(matrix_df.index)))
-    ax.set_yticklabels(matrix_df.index.tolist())
-    ax.set_title(title)
-    if annotate:
-        for row_idx in range(values.shape[0]):
-            for col_idx in range(values.shape[1]):
-                value = values[row_idx, col_idx]
-                text = f"{value:.2f}" if np.issubdtype(values.dtype, np.floating) else str(int(value))
-                ax.text(col_idx, row_idx, text, ha="center", va="center", fontsize=9, color="#111111")
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    fig.tight_layout()
-    fig.savefig(outpath, dpi=180)
-    plt.close(fig)
-
-
-def save_alignment_distribution(df: pd.DataFrame, outpath: Path) -> None:
-    plot_df = df["global_local_similarity"].dropna()
-    if plot_df.empty:
-        return
-    configure_plot_style()
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.hist(plot_df.to_numpy(), bins=40, color="#457b9d", alpha=0.85, edgecolor="white")
-    ax.set_title("Distribution of Global-Local Semantic Similarity")
-    ax.set_xlabel("Cosine Similarity")
-    ax.set_ylabel("Posts")
-    fig.tight_layout()
-    fig.savefig(outpath, dpi=180)
-    plt.close(fig)
-
-
-def save_sentiment_score_hexbin(df: pd.DataFrame, outpath: Path) -> None:
-    plot_df = df.dropna(subset=["global_sentiment_score", "local_sentiment_score"])
-    if plot_df.empty:
-        return
-    configure_plot_style()
-    fig, ax = plt.subplots(figsize=(7, 6))
-    hb = ax.hexbin(
-        plot_df["global_sentiment_score"],
-        plot_df["local_sentiment_score"],
-        gridsize=30,
-        cmap="viridis",
-        mincnt=1,
+    working["context"] = suffix
+    working["text"] = working[f"{suffix}_text"].fillna("").astype(str)
+    return working.loc[:, ["dominant_label", "dominant_score", "text", f"{suffix}_text"]].rename(
+        columns={f"{suffix}_text": "source_text"}
     )
-    ax.set_title("Global vs Local Sentiment Scores")
-    ax.set_xlabel("Global Sentiment Score")
-    ax.set_ylabel("Local Sentiment Score")
-    fig.colorbar(hb, ax=ax, label="Posts")
-    fig.tight_layout()
-    fig.savefig(outpath, dpi=180)
-    plt.close(fig)
 
 
-def compute_monthly_metrics(df: pd.DataFrame, min_posts: int, rolling_months: int) -> pd.DataFrame:
-    mismatch_column = "emotion_mismatch" if "emotion_mismatch" in df.columns else "sentiment_mismatch"
-    monthly = (
-        df.groupby("year_month", observed=True)
-        .agg(
-            posts=("template_final", "size"),
-            mean_alignment=("global_local_similarity", "mean"),
-            mismatch_rate=(mismatch_column, "mean"),
-            mean_local_complexity=("local_complexity_index", "mean"),
-            mean_score=("score", "mean"),
-        )
-        .reset_index()
-        .sort_values("year_month")
-    )
-    monthly["month_start"] = pd.PeriodIndex(monthly["year_month"], freq="M").to_timestamp()
-    monthly["is_reliable_month"] = monthly["posts"] >= min_posts
-    for column in ["mean_alignment", "mismatch_rate", "mean_local_complexity", "mean_score"]:
-        monthly[f"{column}_rolling"] = monthly[column].rolling(rolling_months, min_periods=1).mean()
-    return monthly
+def compute_dominant_summary(df: pd.DataFrame, context: str, threshold: float) -> tuple[pd.DataFrame, pd.DataFrame]:
+    dominant = compute_dominant_affect(df, context)
+    dominant["dominant_score"] = pd.to_numeric(dominant["dominant_score"], errors="coerce")
+    filtered = dominant[
+        dominant["dominant_label"].isin(ALL_AFFECT_LABELS) & dominant["dominant_score"].ge(float(threshold))
+    ].copy()
+    if filtered.empty:
+        summary = pd.DataFrame(columns=["label", "count", "proportion", "mean_score", "median_score"])
+        return filtered, summary
 
-
-def save_monthly_line_plot(
-    monthly_df: pd.DataFrame,
-    value_col: str,
-    outpath: Path,
-    title: str,
-    ylabel: str,
-) -> None:
-    if monthly_df.empty:
-        return
-    configure_plot_style()
-    fig, ax = plt.subplots(figsize=(12, 5.5))
-    ax.plot(monthly_df["month_start"], monthly_df[value_col], color="#1d3557", linewidth=2)
-    ax.scatter(
-        monthly_df.loc[monthly_df["is_reliable_month"], "month_start"],
-        monthly_df.loc[monthly_df["is_reliable_month"], value_col],
-        color="#e63946",
-        s=16,
-    )
-    ax.set_title(title)
-    ax.set_xlabel("Month")
-    ax.set_ylabel(ylabel)
-    ax.grid(alpha=0.25)
-    fig.autofmt_xdate()
-    fig.tight_layout()
-    fig.savefig(outpath, dpi=180)
-    plt.close(fig)
-
-
-def compute_template_conditioned_summary(df: pd.DataFrame, top_templates: pd.DataFrame) -> pd.DataFrame:
-    selected = df[df["template_final"].isin(set(top_templates["template_final"]))].copy()
-    if selected.empty:
-        return pd.DataFrame()
-    mismatch_column = "emotion_mismatch" if "emotion_mismatch" in selected.columns else "sentiment_mismatch"
     summary = (
-        selected.groupby("template_final", observed=True)
-        .agg(
-            total_posts=("template_final", "size"),
-            mismatch_rate=(mismatch_column, "mean"),
-            mean_alignment=("global_local_similarity", "mean"),
-            mean_local_complexity=("local_complexity_index", "mean"),
-            mean_score=("score", "mean"),
-            local_topic_diversity=("local_text", lambda s: float(s.astype(str).str.len().gt(0).mean())),
-        )
+        filtered.groupby("dominant_label", observed=True)["dominant_score"]
+        .agg(count="size", mean_score="mean", median_score="median")
         .reset_index()
+        .rename(columns={"dominant_label": "label"})
+        .sort_values(["count", "mean_score"], ascending=[False, False])
+        .reset_index(drop=True)
     )
-    return summary.merge(top_templates.loc[:, ["template_final", "template_rank"]], on="template_final", how="left")
+    summary["proportion"] = summary["count"] / summary["count"].sum()
+    return filtered, summary
 
 
-def save_template_bar(
-    summary_df: pd.DataFrame,
-    value_col: str,
-    outpath: Path,
-    title: str,
-    ylabel: str,
-    color: str,
-) -> None:
-    if summary_df.empty:
-        return
-    plot_df = summary_df.sort_values("template_rank").copy()
-    labels = [f"{int(rank)}. {name}" for rank, name in zip(plot_df["template_rank"], plot_df["template_final"])]
-    configure_plot_style()
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.bar(labels, plot_df[value_col], color=color, alpha=0.9)
-    ax.set_title(title)
-    ax.set_xlabel("Template")
-    ax.set_ylabel(ylabel)
-    ax.tick_params(axis="x", rotation=50)
-    fig.tight_layout()
-    fig.savefig(outpath, dpi=180)
-    plt.close(fig)
+def build_word_frequencies(
+    texts: pd.Series,
+    min_token_len: int,
+) -> dict[str, float]:
+    frequencies: dict[str, float] = {}
+    for text in texts.fillna("").astype(str):
+        for token in _tokenize(text):
+            normalized = token.strip("'").lower()
+            if not normalized:
+                continue
+            if len(token) < min_token_len:
+                continue
+            if normalized.isdigit():
+                continue
+            if normalized in DEFAULT_STOPWORDS:
+                continue
+            frequencies[normalized] = frequencies.get(normalized, 0.0) + 1.0
+    return frequencies
 
 
-def compute_lifecycle_phase_boundaries(
-    df: pd.DataFrame,
-    template_name: str,
-    freq: str,
-    low_frac: float,
-    sustain_periods: int,
-    zero_run_periods: int,
-) -> dict[str, Any] | None:
-    pandas_freq = _normalize_freq(freq)
-    subset = df[df["template_final"] == template_name].copy().sort_values("created_utc")
-    if subset.empty:
-        return None
-    period_counts = (
-        subset.set_index("created_utc")
-        .resample(pandas_freq)
-        .size()
-        .rename("count")
-        .reset_index()
-        .rename(columns={"created_utc": "period_start"})
+def build_filtered_text(text: str, min_token_len: int) -> str:
+    if not isinstance(text, str):
+        return ""
+    tokens: list[str] = []
+    for token in _tokenize(text):
+        normalized = token.strip("'").lower()
+        if not normalized:
+            continue
+        if len(normalized) < min_token_len:
+            continue
+        if normalized.isdigit():
+            continue
+        if normalized in DEFAULT_STOPWORDS:
+            continue
+        tokens.append(normalized)
+    return " ".join(tokens)
+
+
+def _normalize_rows(matrix: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1.0, norms)
+    return matrix / norms
+
+
+def _rank_words_tfidf(
+    texts_by_label: dict[str, list[str]],
+    freqs_by_label: dict[str, dict[str, float]],
+) -> tuple[dict[str, dict[str, float]], str]:
+    corpus: list[str] = []
+    owners: list[str] = []
+    for label, texts in texts_by_label.items():
+        for text in texts:
+            if text:
+                corpus.append(text)
+                owners.append(label)
+    if not corpus:
+        return {}, "none"
+
+    vectorizer = TfidfVectorizer(token_pattern=r"(?u)\b\w+\b", lowercase=False)
+    matrix = vectorizer.fit_transform(corpus)
+    feature_names = vectorizer.get_feature_names_out()
+    label_order = sorted(texts_by_label)
+
+    centroids: list[np.ndarray] = []
+    for label in label_order:
+        mask = np.array([owner == label for owner in owners], dtype=bool)
+        if not mask.any():
+            centroids.append(np.zeros(matrix.shape[1], dtype=np.float32))
+            continue
+        centroid = np.asarray(matrix[mask].mean(axis=0)).ravel().astype(np.float32)
+        centroids.append(centroid)
+    centroid_matrix = _normalize_rows(np.vstack(centroids))
+    token_to_idx = {token: idx for idx, token in enumerate(feature_names.tolist())}
+
+    ranked: dict[str, dict[str, float]] = {}
+    for label_idx, label in enumerate(label_order):
+        scores: dict[str, float] = {}
+        for token, freq in freqs_by_label.get(label, {}).items():
+            token_idx = token_to_idx.get(token)
+            if token_idx is None:
+                continue
+            word_vec = np.zeros(matrix.shape[1], dtype=np.float32)
+            word_vec[token_idx] = 1.0
+            sims = centroid_matrix @ word_vec
+            own = float(sims[label_idx])
+            others = np.delete(sims, label_idx)
+            margin = own - float(others.max()) if len(others) else own
+            weight = max(margin, 0.0) * math.log1p(float(freq))
+            if weight > 0:
+                scores[token] = weight
+        ranked[label] = scores
+    return ranked, "tfidf"
+
+
+def _rank_words_sbert(
+    texts_by_label: dict[str, list[str]],
+    freqs_by_label: dict[str, dict[str, float]],
+    model_name: str,
+    max_docs_per_class: int,
+    random_seed: int,
+) -> tuple[dict[str, dict[str, float]], str]:
+    sentence_transformer_cls = try_import_sentence_transformers()
+    if sentence_transformer_cls is None:
+        return {}, "none"
+
+    label_order = sorted(texts_by_label)
+    centroid_texts: list[str] = []
+    centroid_owners: list[str] = []
+    for label in label_order:
+        label_texts = [text for text in texts_by_label.get(label, []) if text]
+        if not label_texts:
+            continue
+        if len(label_texts) > max_docs_per_class:
+            rng = np.random.default_rng(random_seed + abs(hash(label)) % 10007)
+            take_idx = rng.choice(len(label_texts), size=max_docs_per_class, replace=False)
+            label_texts = [label_texts[int(idx)] for idx in take_idx]
+        centroid_texts.extend(label_texts)
+        centroid_owners.extend([label] * len(label_texts))
+    if not centroid_texts:
+        return {}, "none"
+
+    model = sentence_transformer_cls(model_name)
+    doc_embeddings = np.asarray(
+        model.encode(centroid_texts, show_progress_bar=False, normalize_embeddings=True),
+        dtype=np.float32,
     )
-    if period_counts.empty:
-        return None
-    full_range = pd.date_range(period_counts["period_start"].min(), period_counts["period_start"].max(), freq=pandas_freq)
-    period_counts = (
-        period_counts.set_index("period_start")
-        .reindex(full_range, fill_value=0)
-        .rename_axis("period_start")
-        .reset_index()
+
+    centroid_rows: list[np.ndarray] = []
+    for label in label_order:
+        mask = np.array([owner == label for owner in centroid_owners], dtype=bool)
+        if not mask.any():
+            centroid_rows.append(np.zeros(doc_embeddings.shape[1], dtype=np.float32))
+            continue
+        centroid = doc_embeddings[mask].mean(axis=0)
+        norm = float(np.linalg.norm(centroid))
+        if norm > 0:
+            centroid = centroid / norm
+        centroid_rows.append(centroid.astype(np.float32))
+    centroid_matrix = np.vstack(centroid_rows)
+
+    vocab = sorted({token for scores in freqs_by_label.values() for token in scores})
+    if not vocab:
+        return {}, "none"
+    word_embeddings = np.asarray(
+        model.encode(vocab, show_progress_bar=False, normalize_embeddings=True),
+        dtype=np.float32,
     )
-    period_counts["smooth"] = period_counts["count"].rolling(3, min_periods=1).mean()
-    peak_idx = int(period_counts["smooth"].idxmax())
-    peak_period = pd.Timestamp(period_counts.loc[peak_idx, "period_start"])
-    peak_value = float(period_counts.loc[peak_idx, "smooth"])
-    threshold = peak_value * low_frac
+    similarities = word_embeddings @ centroid_matrix.T
+    token_to_idx = {token: idx for idx, token in enumerate(vocab)}
 
-    post_peak = period_counts.loc[peak_idx + 1 :].copy()
-    post_peak["low"] = post_peak["smooth"] <= threshold
-    post_peak["low_run"] = post_peak["low"].rolling(sustain_periods, min_periods=sustain_periods).sum()
-    decline_candidates = post_peak.loc[post_peak["low_run"] == sustain_periods, "period_start"]
-    decline_start = pd.NaT if decline_candidates.empty else pd.Timestamp(decline_candidates.iloc[0])
+    ranked: dict[str, dict[str, float]] = {}
+    for label_idx, label in enumerate(label_order):
+        scores: dict[str, float] = {}
+        for token, freq in freqs_by_label.get(label, {}).items():
+            token_idx = token_to_idx.get(token)
+            if token_idx is None:
+                continue
+            sims = similarities[token_idx]
+            own = float(sims[label_idx])
+            others = np.delete(sims, label_idx)
+            margin = own - float(others.max()) if len(others) else own
+            weight = max(margin, 0.0) * math.log1p(float(freq))
+            if weight > 0:
+                scores[token] = weight
+        ranked[label] = scores
+    return ranked, "sbert"
 
-    post_peak["zero"] = post_peak["count"] == 0
-    post_peak["zero_run"] = post_peak["zero"].rolling(zero_run_periods, min_periods=zero_run_periods).sum()
-    expired_candidates = post_peak.loc[post_peak["zero_run"] == zero_run_periods, "period_start"]
-    expired_at = pd.NaT if expired_candidates.empty else pd.Timestamp(expired_candidates.iloc[0])
 
-    offset = pd.tseries.frequencies.to_offset(pandas_freq)
-    peak_window_start = peak_period - offset
-    peak_window_end = peak_period + offset
-    mature_start = peak_window_end
-    if pd.isna(decline_start):
-        decline_start = pd.NaT
-    return {
-        "template_final": template_name,
-        "first_seen": pd.Timestamp(subset["created_utc"].min()),
-        "peak_period": peak_period,
-        "peak_window_start": peak_window_start,
-        "peak_window_end": peak_window_end,
-        "decline_start": decline_start,
-        "expired_at": expired_at,
+def rank_words_for_wordclouds(
+    dominant_df: pd.DataFrame,
+    min_token_len: int,
+    backend: str,
+    embedding_model: str,
+    max_docs_per_class: int,
+    random_seed: int,
+) -> tuple[dict[str, dict[str, float]], pd.DataFrame, str]:
+    working = dominant_df.copy()
+    working["filtered_text"] = working["source_text"].fillna("").astype(str).map(
+        lambda text: build_filtered_text(text, min_token_len=min_token_len)
+    )
+    working = working[working["filtered_text"].str.strip().ne("")].copy()
+    if working.empty:
+        return {}, pd.DataFrame(columns=["label", "word", "weight", "frequency"]), "none"
+
+    texts_by_label = (
+        working.groupby("dominant_label", observed=True)["filtered_text"].apply(list).to_dict()
+    )
+    freqs_by_label = {
+        label: build_word_frequencies(pd.Series(texts), min_token_len=min_token_len)
+        for label, texts in texts_by_label.items()
     }
 
-
-def assign_lifecycle_phases(
-    df: pd.DataFrame,
-    top_templates: pd.DataFrame,
-    freq: str,
-    low_frac: float,
-    sustain_periods: int,
-    zero_run_periods: int,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    phase_rows: list[dict[str, Any]] = []
-    annotated_parts: list[pd.DataFrame] = []
-    for row in top_templates.itertuples(index=False):
-        boundaries = compute_lifecycle_phase_boundaries(
-            df,
-            template_name=row.template_final,
-            freq=freq,
-            low_frac=low_frac,
-            sustain_periods=sustain_periods,
-            zero_run_periods=zero_run_periods,
+    ranked: dict[str, dict[str, float]] = {}
+    used_backend = "none"
+    if backend in {"auto", "sbert"}:
+        ranked, used_backend = _rank_words_sbert(
+            texts_by_label=texts_by_label,
+            freqs_by_label=freqs_by_label,
+            model_name=embedding_model,
+            max_docs_per_class=max_docs_per_class,
+            random_seed=random_seed,
         )
-        if boundaries is None:
-            continue
-        phase_rows.append({**boundaries, "template_rank": int(row.template_rank)})
-        subset = df[df["template_final"] == row.template_final].copy()
-        if subset.empty:
-            continue
-        subset["template_rank"] = int(row.template_rank)
+        if backend == "sbert" and used_backend == "none":
+            raise RuntimeError("sentence-transformers is unavailable for --keyword-backend=sbert")
 
-        def phase_for_time(ts: pd.Timestamp) -> str:
-            if ts <= boundaries["peak_window_start"]:
-                return "early"
-            if ts <= boundaries["peak_window_end"]:
-                return "peak"
-            if pd.isna(boundaries["decline_start"]):
-                return "mature"
-            if ts < boundaries["decline_start"]:
-                return "mature"
-            if pd.notna(boundaries["expired_at"]) and ts >= boundaries["expired_at"]:
-                return "tail"
-            return "decline"
-
-        subset["lifecycle_phase"] = subset["created_utc"].map(phase_for_time)
-        annotated_parts.append(subset)
-    phase_df = pd.DataFrame(phase_rows)
-    annotated = pd.concat(annotated_parts, ignore_index=True) if annotated_parts else pd.DataFrame()
-    return phase_df, annotated
-
-
-def save_phase_metric_plot(
-    phase_summary: pd.DataFrame,
-    value_col: str,
-    outpath: Path,
-    title: str,
-    ylabel: str,
-) -> None:
-    if phase_summary.empty:
-        return
-    plot_df = phase_summary.copy()
-    plot_df["lifecycle_phase"] = pd.Categorical(plot_df["lifecycle_phase"], categories=PHASE_ORDER, ordered=True)
-    plot_df = plot_df.sort_values(["template_rank", "lifecycle_phase"])
-    configure_plot_style()
-    fig, ax = plt.subplots(figsize=(12, 6))
-    for template_name, group in plot_df.groupby("template_final", observed=True):
-        ax.plot(
-            group["lifecycle_phase"].astype(str),
-            group[value_col],
-            marker="o",
-            linewidth=1.8,
-            label=f"{int(group['template_rank'].iloc[0])}. {template_name}",
+    if used_backend == "none":
+        ranked, used_backend = _rank_words_tfidf(
+            texts_by_label=texts_by_label,
+            freqs_by_label=freqs_by_label,
         )
-    ax.set_title(title)
-    ax.set_xlabel("Lifecycle Phase")
-    ax.set_ylabel(ylabel)
-    ax.legend(loc="upper left", fontsize=8, ncol=2)
-    ax.grid(alpha=0.25)
-    fig.tight_layout()
-    fig.savefig(outpath, dpi=180)
-    plt.close(fig)
 
-
-def compute_topic_outputs_bertopic(
-    df: pd.DataFrame,
-    n_topics: int,
-    topic_max_features: int,
-    topic_min_df: int,
-    max_docs_fit: int,
-    random_seed: int,
-    topic_embedding_model: str,
-    batch_size: int,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    try:
-        from bertopic import BERTopic  # type: ignore
-        from bertopic.representation import KeyBERTInspired, MaximalMarginalRelevance  # type: ignore
-        from hdbscan import HDBSCAN  # type: ignore
-        from sentence_transformers import SentenceTransformer  # type: ignore
-        from umap import UMAP  # type: ignore
-    except Exception as exc:
-        raise RuntimeError("BERTopic stack is unavailable. Install bertopic, umap-learn, and hdbscan.") from exc
-
-    working = df.copy()
-    working["global_text"] = working["global_text"].fillna("").astype(str)
-    working["local_text"] = working["local_text"].fillna("").astype(str)
-    fit_docs = pd.concat([working["global_text"], working["local_text"]], ignore_index=True)
-    fit_docs = fit_docs[fit_docs.str.strip().astype(bool)]
-    if fit_docs.empty:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-    if len(fit_docs) > max_docs_fit:
-        fit_docs = fit_docs.sample(max_docs_fit, random_state=random_seed).reset_index(drop=True)
-
-    embedding_model = SentenceTransformer(topic_embedding_model)
-    umap_model = UMAP(n_neighbors=20, n_components=5, min_dist=0.0, metric="cosine", random_state=random_seed)
-    hdbscan_model = HDBSCAN(
-        min_cluster_size=max(15, min(30, max(10, len(fit_docs) // 400))),
-        min_samples=10,
-        metric="euclidean",
-        cluster_selection_method="eom",
-    )
-    vectorizer_model = CountVectorizer(stop_words="english", max_features=topic_max_features, min_df=topic_min_df)
-    representation_model = [KeyBERTInspired(), MaximalMarginalRelevance(diversity=0.5)]
-    topic_model = BERTopic(
-        embedding_model=embedding_model,
-        umap_model=umap_model,
-        hdbscan_model=hdbscan_model,
-        vectorizer_model=vectorizer_model,
-        nr_topics=max(2, n_topics),
-        representation_model=representation_model,
-        verbose=False,
-    )
-
-    fit_embeddings = embedding_model.encode(
-        fit_docs.tolist(),
-        batch_size=batch_size,
-        show_progress_bar=False,
-        normalize_embeddings=True,
-    )
-    topic_model.fit(fit_docs.tolist(), fit_embeddings)
-    working["global_topic_id"] = -1
-    working["local_topic_id"] = -1
-    working["global_topic_weight"] = np.nan
-    working["local_topic_weight"] = np.nan
-
-    for text_column, topic_column, weight_column in [
-        ("global_text", "global_topic_id", "global_topic_weight"),
-        ("local_text", "local_topic_id", "local_topic_weight"),
-    ]:
-        valid_mask = working[text_column].str.strip().ne("")
-        if not valid_mask.any():
-            continue
-        docs = working.loc[valid_mask, text_column].tolist()
-        embeddings = embedding_model.encode(
-            docs,
-            batch_size=batch_size,
-            show_progress_bar=False,
-            normalize_embeddings=True,
-        )
-        topics, probs = topic_model.transform(docs, embeddings=embeddings)
-        working.loc[valid_mask, topic_column] = np.asarray(topics, dtype=int)
-        working.loc[valid_mask, weight_column] = [
-            float(np.nanmax(prob)) if hasattr(prob, "__len__") and len(prob) else float("nan") for prob in probs
-        ]
-
-    topic_info = topic_model.get_topic_info()
-    topic_terms = topic_info.loc[:, ["Topic", "Name"]].rename(columns={"Topic": "topic_id", "Name": "top_terms"})
-    topic_terms["topic_id"] = topic_terms["topic_id"].astype(int)
-    global_summary = (
-        working["global_topic_id"].value_counts(normalize=True)
-        .rename_axis("topic_id")
-        .reset_index(name="share_global")
-        .merge(topic_terms, on="topic_id", how="left")
-        .sort_values("share_global", ascending=False)
-    )
-    local_summary = (
-        working["local_topic_id"].value_counts(normalize=True)
-        .rename_axis("topic_id")
-        .reset_index(name="share_local")
-        .merge(topic_terms, on="topic_id", how="left")
-        .sort_values("share_local", ascending=False)
-    )
-    transition = (
-        working.groupby(["global_topic_id", "local_topic_id"], observed=True)
-        .size()
-        .rename("count")
-        .reset_index()
-    )
-    return working, topic_terms, global_summary, local_summary.merge(
-        transition, how="outer", left_on="topic_id", right_on="local_topic_id"
-    )
-
-
-def compute_topic_outputs(
-    df: pd.DataFrame,
-    n_topics: int,
-    topic_max_features: int,
-    topic_min_df: int,
-    max_docs_fit: int,
-    random_seed: int,
-    topic_model: str,
-    topic_embedding_model: str,
-    bertopic_batch_size: int,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    if topic_model == "bertopic":
-        try:
-            return compute_topic_outputs_bertopic(
-                df,
-                n_topics=n_topics,
-                topic_max_features=topic_max_features,
-                topic_min_df=topic_min_df,
-                max_docs_fit=max_docs_fit,
-                random_seed=random_seed,
-                topic_embedding_model=topic_embedding_model,
-                batch_size=bertopic_batch_size,
-            )
-        except Exception:
-            pass
-    working = df.copy()
-    working["global_text"] = working["global_text"].fillna("").astype(str)
-    working["local_text"] = working["local_text"].fillna("").astype(str)
-    fit_docs = pd.concat([working["global_text"], working["local_text"]], ignore_index=True)
-    fit_docs = fit_docs[fit_docs.str.strip().astype(bool)]
-    if fit_docs.empty:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-    if len(fit_docs) > max_docs_fit:
-        fit_docs = fit_docs.sample(max_docs_fit, random_state=random_seed).reset_index(drop=True)
-
-    vectorizer = TfidfVectorizer(stop_words="english", max_features=topic_max_features, min_df=topic_min_df)
-    fit_matrix = vectorizer.fit_transform(fit_docs.tolist())
-    effective_topics = max(2, min(n_topics, fit_matrix.shape[0] - 1, fit_matrix.shape[1] - 1))
-    nmf = NMF(n_components=effective_topics, random_state=random_seed, init="nndsvda", max_iter=400)
-    nmf.fit(fit_matrix)
-
-    global_matrix = vectorizer.transform(working["global_text"].tolist())
-    local_matrix = vectorizer.transform(working["local_text"].tolist())
-    global_topics = nmf.transform(global_matrix)
-    local_topics = nmf.transform(local_matrix)
-    working["global_topic_id"] = np.asarray(global_topics.argmax(axis=1), dtype=int)
-    working["local_topic_id"] = np.asarray(local_topics.argmax(axis=1), dtype=int)
-    working["global_topic_weight"] = global_topics.max(axis=1)
-    working["local_topic_weight"] = local_topics.max(axis=1)
-
-    feature_names = vectorizer.get_feature_names_out()
-    topic_rows: list[dict[str, Any]] = []
-    for topic_idx, weights in enumerate(nmf.components_):
-        top_idx = np.argsort(weights)[::-1][:12]
-        topic_rows.append(
-            {
-                "topic_id": int(topic_idx),
-                "top_terms": " | ".join(feature_names[top_idx].tolist()),
-            }
-        )
-    topic_terms = pd.DataFrame(topic_rows)
-
-    global_summary = (
-        working["global_topic_id"].value_counts(normalize=True)
-        .rename_axis("topic_id")
-        .reset_index(name="share_global")
-        .merge(topic_terms, on="topic_id", how="left")
-        .sort_values("share_global", ascending=False)
-    )
-    local_summary = (
-        working["local_topic_id"].value_counts(normalize=True)
-        .rename_axis("topic_id")
-        .reset_index(name="share_local")
-        .merge(topic_terms, on="topic_id", how="left")
-        .sort_values("share_local", ascending=False)
-    )
-    transition = (
-        working.groupby(["global_topic_id", "local_topic_id"], observed=True)
-        .size()
-        .rename("count")
-        .reset_index()
-    )
-    return working, topic_terms, global_summary, local_summary.merge(transition, how="outer", left_on="topic_id", right_on="local_topic_id")
-
-
-def compute_topic_transition_matrix(df: pd.DataFrame) -> pd.DataFrame:
-    if "global_topic_id" not in df.columns or "local_topic_id" not in df.columns:
-        return pd.DataFrame()
-    matrix = (
-        df.groupby(["global_topic_id", "local_topic_id"], observed=True)
-        .size()
-        .rename("count")
-        .reset_index()
-        .pivot(index="global_topic_id", columns="local_topic_id", values="count")
-        .fillna(0)
-    )
-    row_totals = matrix.sum(axis=1).replace(0, np.nan)
-    return matrix.div(row_totals, axis=0).fillna(0.0)
-
-
-def save_topic_bar(summary_df: pd.DataFrame, share_col: str, outpath: Path, title: str) -> None:
-    if summary_df.empty:
-        return
-    plot_df = summary_df.head(10).copy()
-    labels = [f"T{int(topic_id)}" for topic_id in plot_df["topic_id"]]
-    configure_plot_style()
-    fig, ax = plt.subplots(figsize=(11, 5))
-    ax.bar(labels, plot_df[share_col], color="#6c8ebf")
-    ax.set_title(title)
-    ax.set_xlabel("Topic")
-    ax.set_ylabel("Share")
-    fig.tight_layout()
-    fig.savefig(outpath, dpi=180)
-    plt.close(fig)
-
-
-def top_terms_by_group(
-    texts: pd.Series,
-    groups: pd.Series,
-    top_n: int,
-    max_features: int,
-    min_df: int,
-) -> pd.DataFrame:
-    valid = texts.astype(str).str.strip().ne("") & groups.astype(str).str.strip().ne("")
-    if not valid.any():
-        return pd.DataFrame()
-    texts = texts.loc[valid].astype(str)
-    groups = groups.loc[valid].astype(str)
-    vectorizer = TfidfVectorizer(stop_words="english", max_features=max_features, min_df=min_df)
-    try:
-        matrix = vectorizer.fit_transform(texts.tolist())
-    except ValueError:
-        fallback_vectorizer = TfidfVectorizer(stop_words="english", max_features=max_features, min_df=1)
-        try:
-            matrix = fallback_vectorizer.fit_transform(texts.tolist())
-            vectorizer = fallback_vectorizer
-        except ValueError:
-            return pd.DataFrame()
-    feature_names = vectorizer.get_feature_names_out()
     rows: list[dict[str, Any]] = []
-    for group_name in sorted(groups.unique().tolist()):
-        mask = (groups == group_name).to_numpy(dtype=bool)
-        group_mean = np.asarray(matrix[mask].mean(axis=0)).ravel()
-        top_idx = np.argsort(group_mean)[::-1][:top_n]
-        for rank, idx in enumerate(top_idx, start=1):
+    for label, scores in ranked.items():
+        for word, weight in sorted(scores.items(), key=lambda item: item[1], reverse=True):
             rows.append(
                 {
-                    "group": group_name,
-                    "rank": int(rank),
-                    "term": str(feature_names[idx]),
-                    "score": float(group_mean[idx]),
+                    "label": label,
+                    "word": word,
+                    "weight": float(weight),
+                    "frequency": float(freqs_by_label.get(label, {}).get(word, 0.0)),
                 }
             )
-    return pd.DataFrame(rows)
+    return ranked, pd.DataFrame(rows), used_backend
 
 
-def save_group_term_plot(term_df: pd.DataFrame, outpath: Path, title: str) -> None:
-    if term_df.empty:
+def save_score_histogram_grid(
+    df: pd.DataFrame,
+    context: str,
+    outpath: Path,
+    bins: int,
+) -> None:
+    suffix = _normalize_context_name(context)
+    columns = [f"{label}_{suffix}" for label in ALL_AFFECT_LABELS if f"{label}_{suffix}" in df.columns]
+    if not columns:
         return
-    groups = term_df["group"].unique().tolist()[:4]
+
     configure_plot_style()
-    fig, axes = plt.subplots(len(groups), 1, figsize=(11, 3.2 * len(groups)))
-    if len(groups) == 1:
-        axes = [axes]
-    for ax, group_name in zip(axes, groups):
-        group = term_df[term_df["group"] == group_name].sort_values("score", ascending=True)
-        ax.barh(group["term"], group["score"], color="#f4a261")
-        ax.set_title(f"{group_name}")
-        ax.set_xlabel("Mean TF-IDF")
-    fig.suptitle(title, y=0.995)
+    plt.rcParams.update(
+        {
+            "axes.facecolor": "#f7f9fc",
+            "figure.facecolor": "#ffffff",
+            "grid.color": "#d5deed",
+            "grid.alpha": 0.45,
+        }
+    )
+    ncols = 4
+    nrows = math.ceil(len(columns) / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(17, 4.25 * nrows))
+    axes_list = np.atleast_1d(axes).ravel().tolist()
+
+    for ax, label in zip(axes_list, ALL_AFFECT_LABELS):
+        column = f"{label}_{suffix}"
+        if column not in df.columns:
+            ax.axis("off")
+            continue
+        scores = pd.to_numeric(df[column], errors="coerce").dropna()
+        color = LABEL_COLORS.get(label, CONTEXT_COLORS[suffix])
+        ax.hist(scores, bins=bins, color=color, alpha=0.85, edgecolor="#223047", linewidth=0.9)
+        if not scores.empty:
+            ax.axvline(float(scores.mean()), color="#111111", linestyle="--", linewidth=1.2, alpha=0.85)
+        ax.set_title(f"{label}_{suffix}", fontsize=16)
+        ax.set_xlim(0, 1)
+        ax.grid(True, axis="y")
+
+    for ax in axes_list[len(ALL_AFFECT_LABELS) :]:
+        ax.axis("off")
+
+    fig.suptitle(
+        f"Histogram of Affect Scores ({suffix.title()} Context)",
+        fontsize=28,
+        y=0.995,
+    )
     fig.tight_layout()
     fig.savefig(outpath, dpi=180)
     plt.close(fig)
 
 
-def save_complexity_vs_score(df: pd.DataFrame, outpath: Path) -> None:
-    plot_df = df.dropna(subset=["local_complexity_index", "score"]).copy()
-    if plot_df.empty:
+def save_dominant_proportion_chart(
+    summary_df: pd.DataFrame,
+    context: str,
+    threshold: float,
+    outpath: Path,
+) -> None:
+    if summary_df.empty:
         return
-    configure_plot_style()
-    fig, ax = plt.subplots(figsize=(8, 6))
-    ax.scatter(plot_df["local_complexity_index"], np.log1p(plot_df["score"]), s=8, alpha=0.18, color="#2a9d8f")
-    ax.set_title("Local Complexity vs Log Upvotes")
-    ax.set_xlabel("Local Complexity Index")
-    ax.set_ylabel("log(1 + score)")
+    plot_df = summary_df.copy()
+    fig, ax = _theme_plot((12.5, 6.5))
+    colors = [LABEL_COLORS.get(label, CONTEXT_COLORS[_normalize_context_name(context)]) for label in plot_df["label"]]
+    ax.bar(plot_df["label"], plot_df["proportion"], color=colors, edgecolor="#233142", linewidth=1.0, alpha=0.95)
+    ax.set_title(
+        f"Proportion of Dominant Affect Classes in {context.title()} Context (Score > {threshold:.1f})"
+    )
+    ax.set_xlabel("Affect Class")
+    ax.set_ylabel("Proportion")
+    ax.set_ylim(0, max(0.05, float(plot_df["proportion"].max()) * 1.18))
+    ax.tick_params(axis="x", rotation=40)
     fig.tight_layout()
     fig.savefig(outpath, dpi=180)
     plt.close(fig)
 
 
-def save_alignment_vs_score(df: pd.DataFrame, outpath: Path) -> None:
-    plot_df = df.dropna(subset=["global_local_similarity", "score"]).copy()
-    if plot_df.empty:
+def _smooth_histogram(counts: np.ndarray) -> np.ndarray:
+    kernel = np.array([1.0, 2.0, 3.0, 2.0, 1.0], dtype=float)
+    kernel /= kernel.sum()
+    return np.convolve(counts, kernel, mode="same")
+
+
+def save_dominant_score_overlay(
+    dominant_df: pd.DataFrame,
+    summary_df: pd.DataFrame,
+    context: str,
+    threshold: float,
+    outpath: Path,
+    bins: int,
+    top_n: int,
+) -> None:
+    if dominant_df.empty or summary_df.empty:
         return
-    configure_plot_style()
-    fig, ax = plt.subplots(figsize=(8, 6))
-    ax.scatter(plot_df["global_local_similarity"], np.log1p(plot_df["score"]), s=8, alpha=0.18, color="#8d99ae")
-    ax.set_title("Global-Local Alignment vs Log Upvotes")
-    ax.set_xlabel("Global-Local Similarity")
-    ax.set_ylabel("log(1 + score)")
+    top_labels = summary_df.head(top_n)["label"].tolist()
+    if not top_labels:
+        return
+
+    fig, ax = _theme_plot((13, 6.5))
+    edges = np.linspace(threshold, 1.0, bins + 1)
+    centers = (edges[:-1] + edges[1:]) / 2
+    legend_labels: list[str] = []
+    for label in top_labels:
+        values = dominant_df.loc[dominant_df["dominant_label"] == label, "dominant_score"].dropna().to_numpy(dtype=float)
+        if len(values) == 0:
+            continue
+        color = LABEL_COLORS.get(label, CONTEXT_COLORS[_normalize_context_name(context)])
+        ax.hist(
+            values,
+            bins=edges,
+            color=color,
+            alpha=0.42,
+            edgecolor="#111111",
+            linewidth=0.9,
+            label=f"Dominant-{label.title()} Memes",
+        )
+        counts, _ = np.histogram(values, bins=edges)
+        ax.plot(centers, _smooth_histogram(counts), color=color, linewidth=2.2)
+        legend_labels.append(label)
+
+    if not legend_labels:
+        plt.close(fig)
+        return
+
+    ax.set_title(
+        f"Distribution of Dominant Affect Scores in {context.title()} Context (Score > {threshold:.1f})"
+    )
+    ax.set_xlabel("Dominant Score")
+    ax.set_ylabel("Count")
+    ax.set_xlim(threshold, 1.0)
+    ax.legend(loc="upper left")
     fig.tight_layout()
     fig.savefig(outpath, dpi=180)
     plt.close(fig)
+
+
+def save_mean_dominant_score_chart(
+    summary_df: pd.DataFrame,
+    context: str,
+    threshold: float,
+    outpath: Path,
+) -> None:
+    if summary_df.empty:
+        return
+    plot_df = summary_df.sort_values(["mean_score", "count"], ascending=[False, False]).copy()
+    fig, ax = _theme_plot((12.5, 6.5))
+    colors = [LABEL_COLORS.get(label, CONTEXT_COLORS[_normalize_context_name(context)]) for label in plot_df["label"]]
+    bars = ax.bar(
+        plot_df["label"],
+        plot_df["mean_score"],
+        color=colors,
+        edgecolor="#233142",
+        linewidth=1.0,
+        alpha=0.95,
+    )
+    for bar, count in zip(bars, plot_df["count"]):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + 0.01,
+            f"n={int(count)}",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+        )
+    ax.set_title(
+        f"Mean Dominant Affect Score by Class in {context.title()} Context (Score > {threshold:.1f})"
+    )
+    ax.set_xlabel("Affect Class")
+    ax.set_ylabel("Mean Dominant Score")
+    ax.set_ylim(threshold, 1.03)
+    ax.tick_params(axis="x", rotation=40)
+    fig.tight_layout()
+    fig.savefig(outpath, dpi=180)
+    plt.close(fig)
+
+
+def save_wordclouds(
+    dominant_df: pd.DataFrame,
+    summary_df: pd.DataFrame,
+    context: str,
+    threshold: float,
+    outdir: Path,
+    max_words: int,
+    min_token_len: int,
+    keyword_backend: str,
+    keyword_embedding_model: str,
+    keyword_max_docs_per_class: int,
+    random_seed: int,
+) -> tuple[int, int, str]:
+    if dominant_df.empty or summary_df.empty:
+        return 0, 0, "none"
+
+    context_name = _normalize_context_name(context)
+    context_dir = ensure_dir(outdir / f"wordclouds_{context_name}")
+    ranked_words, keyword_df, used_backend = rank_words_for_wordclouds(
+        dominant_df=dominant_df,
+        min_token_len=min_token_len,
+        backend=keyword_backend,
+        embedding_model=keyword_embedding_model,
+        max_docs_per_class=keyword_max_docs_per_class,
+        random_seed=random_seed,
+    )
+    keyword_df.to_csv(outdir / f"{context_name}_wordcloud_keyword_weights.csv", index=False)
+    if WordCloud is None:
+        return 0, 0, used_backend
+
+    cloud_arrays: list[tuple[str, np.ndarray]] = []
+    saved = 0
+    for label in ALL_AFFECT_LABELS:
+        frequencies = ranked_words.get(label, {})
+        if not frequencies:
+            continue
+        base_color = LABEL_COLORS.get(label, CONTEXT_COLORS[context_name])
+        wordcloud = WordCloud(
+            width=1400,
+            height=820,
+            background_color="white",
+            prefer_horizontal=0.92,
+            collocations=False,
+            max_words=max_words,
+            random_state=random_seed,
+            color_func=_build_wordcloud_color_func(base_color),
+        ).generate_from_frequencies(frequencies)
+        image = wordcloud.to_array()
+        cloud_arrays.append((label, image))
+
+        fig, ax = plt.subplots(figsize=(10, 5.5))
+        ax.imshow(image, interpolation="bilinear")
+        ax.axis("off")
+        ax.set_title(
+            f"Word Cloud for {label.title()} Memes ({context.title()} Context, Score > {threshold:.1f})",
+            fontsize=16,
+        )
+        fig.tight_layout()
+        fig.savefig(context_dir / f"{label}.png", dpi=180, bbox_inches="tight")
+        plt.close(fig)
+        saved += 1
+
+    if not cloud_arrays:
+        return 0, 0
+
+    ncols = 3
+    nrows = math.ceil(len(cloud_arrays) / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(18, 5.2 * nrows))
+    axes_list = np.atleast_1d(axes).ravel().tolist()
+    for ax, (label, image) in zip(axes_list, cloud_arrays):
+        ax.imshow(image, interpolation="bilinear")
+        ax.axis("off")
+        ax.set_title(label, fontsize=14)
+    for ax in axes_list[len(cloud_arrays) :]:
+        ax.axis("off")
+    fig.suptitle(
+        f"Word Clouds by Dominant Affect Class ({context.title()} Context)",
+        fontsize=24,
+        y=0.995,
+    )
+    fig.tight_layout()
+    fig.savefig(outdir / f"fig_wordcloud_grid_{context_name}.png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    return saved, len(cloud_arrays), used_backend
 
 
 def run_analysis(args: argparse.Namespace) -> Path:
     outdir = ensure_dir(args.results_dir)
-    df = load_analysis_dataframe(args.analysis_parquet)
+    data_dir = Path(args.analysis_parquet).expanduser().resolve().parent
+    df, bundle_metadata = build_current_data_bundle_raw(data_dir)
+    df["score"] = pd.to_numeric(df.get("score"), errors="coerce").fillna(0.0)
+    df["global_text"] = df.apply(
+        lambda row: build_text(
+            row.get("global_context_description", ""),
+            row.get("global_context_keywords_text", ""),
+        ),
+        axis=1,
+    )
+    df["local_text"] = df.apply(
+        lambda row: build_text(
+            row.get("local_context_user_texts_text", ""),
+            row.get("local_context_text_meaning", ""),
+            row.get("local_context_instance_specific_image_description", ""),
+            row.get("local_context_keywords_text", ""),
+            row.get("title", ""),
+            row.get("body", ""),
+        ),
+        axis=1,
+    )
+    df = df[
+        df["global_text"].fillna("").astype(str).str.strip().ne("")
+        | df["local_text"].fillna("").astype(str).str.strip().ne("")
+    ].copy()
+    bundle_metadata["bundle_rows_with_any_text"] = int(len(df))
     if args.max_rows > 0:
         df = df.head(args.max_rows).copy()
+
     df = add_affect_layers(df, args)
-    df = add_local_complexity_features(df)
-    df = compute_alignment(
-        df,
-        backend=args.alignment_backend,
-        sbert_model=args.sbert_model,
-        max_features=args.alignment_max_features,
-    )
-    top_templates = select_top_templates(
-        df,
-        ranking=args.template_ranking,
-        top_k=args.top_k_templates,
-        min_posts=args.min_template_posts,
-    )
+    metadata: dict[str, Any] = {
+        "analysis_parquet": str(Path(args.analysis_parquet).expanduser().resolve()),
+        "data_source": "current_data_bundle",
+        "results_dir": str(outdir),
+        "rows_analyzed": int(len(df)),
+        "emotion_backend": args.emotion_backend,
+        "emotion_threshold": float(args.emotion_threshold),
+        "hist_bins": int(args.hist_bins),
+        "dominant_top_n": int(args.dominant_top_n),
+        "wordcloud_available": bool(WordCloud is not None),
+        "wordcloud_max_words": int(args.wordcloud_max_words),
+        "keyword_backend_requested": args.keyword_backend,
+        "keyword_embedding_model": args.keyword_embedding_model,
+        "keyword_max_docs_per_class": int(args.keyword_max_docs_per_class),
+        **bundle_metadata,
+    }
 
-    pair_matrix, pair_norm = compute_paired_sentiment_outputs(df)
-    emotion_pair_matrix, emotion_pair_norm = compute_paired_emotion_outputs(df)
-    pair_matrix.to_csv(outdir / "paired_sentiment_counts.csv")
-    pair_norm.to_csv(outdir / "paired_sentiment_row_normalized.csv")
-    emotion_pair_matrix.to_csv(outdir / "paired_emotion_counts.csv")
-    emotion_pair_norm.to_csv(outdir / "paired_emotion_row_normalized.csv")
-    save_heatmap(pair_matrix, outdir / "fig_paired_sentiment_counts.png", "Global vs Local Sentiment Counts", cmap="Purples")
-    save_heatmap(pair_norm, outdir / "fig_paired_sentiment_normalized.png", "Global vs Local Sentiment Transition Rates", cmap="Blues")
-    save_heatmap(
-        emotion_pair_matrix,
-        outdir / "fig_paired_emotion_counts.png",
-        "Global vs Local Dominant Emotion Counts",
-        cmap="Oranges",
-        annotate=False,
-    )
-    save_heatmap(
-        emotion_pair_norm,
-        outdir / "fig_paired_emotion_normalized.png",
-        "Global vs Local Dominant Emotion Transition Rates",
-        cmap="YlOrBr",
-        annotate=False,
-    )
-    save_alignment_distribution(df, outdir / "fig_alignment_distribution.png")
-    save_sentiment_score_hexbin(df, outdir / "fig_sentiment_score_hexbin.png")
-
-    global_dominant = compute_dominant_affect_counts(df, "global_dominant_emotion")
-    local_dominant = compute_dominant_affect_counts(df, "local_dominant_emotion")
-    global_threshold = compute_threshold_proportions(df, "global", args.emotion_threshold)
-    local_threshold = compute_threshold_proportions(df, "local", args.emotion_threshold)
-    global_monthly_affect = compute_monthly_affect_trends(df, "global", args.emotion_threshold, args.emotion_top_n)
-    local_monthly_affect = compute_monthly_affect_trends(df, "local", args.emotion_threshold, args.emotion_top_n)
-    global_dominant.to_csv(outdir / "global_dominant_emotion_counts.csv", index=False)
-    local_dominant.to_csv(outdir / "local_dominant_emotion_counts.csv", index=False)
-    global_threshold.to_csv(outdir / "global_threshold_emotion_proportions.csv", index=False)
-    local_threshold.to_csv(outdir / "local_threshold_emotion_proportions.csv", index=False)
-    global_monthly_affect.to_csv(outdir / "global_monthly_affect_trends.csv", index=False)
-    local_monthly_affect.to_csv(outdir / "local_monthly_affect_trends.csv", index=False)
-    save_count_bar_chart(
-        global_dominant,
-        outdir / "fig_global_dominant_emotions.png",
-        "Global Context: Dominant Emotion Distribution",
-        "Posts",
-        "#4c78a8",
-    )
-    save_count_bar_chart(
-        local_dominant,
-        outdir / "fig_local_dominant_emotions.png",
-        "Local Context: Dominant Emotion Distribution",
-        "Posts",
-        "#f58518",
-    )
-    save_share_bar_chart(
-        global_threshold,
-        outdir / "fig_global_threshold_emotions.png",
-        f"Global Context: Share Above Emotion Threshold ({args.emotion_threshold:.2f})",
-        "Share of Posts",
-        "#54a24b",
-    )
-    save_share_bar_chart(
-        local_threshold,
-        outdir / "fig_local_threshold_emotions.png",
-        f"Local Context: Share Above Emotion Threshold ({args.emotion_threshold:.2f})",
-        "Share of Posts",
-        "#e45756",
-    )
-    save_monthly_affect_plot(
-        global_monthly_affect,
-        "global",
-        outdir / "fig_global_monthly_affect_trends.png",
-        "Global Context: Monthly Normalized Emotion Trends",
-    )
-    save_monthly_affect_plot(
-        local_monthly_affect,
-        "local",
-        outdir / "fig_local_monthly_affect_trends.png",
-        "Local Context: Monthly Normalized Emotion Trends",
-    )
-
-    monthly_metrics = compute_monthly_metrics(df, args.monthly_min_posts, args.rolling_months)
-    monthly_metrics.to_csv(outdir / "monthly_semantic_metrics.csv", index=False)
-    save_monthly_line_plot(
-        monthly_metrics,
-        "mean_alignment_rolling",
-        outdir / "fig_monthly_alignment.png",
-        "Monthly Global-Local Alignment",
-        "Rolling Mean Similarity",
-    )
-    save_monthly_line_plot(
-        monthly_metrics,
-        "mismatch_rate_rolling",
-        outdir / "fig_monthly_sentiment_mismatch.png",
-        "Monthly Global-Local Emotion Mismatch",
-        "Rolling Dominant-Emotion Mismatch Rate",
-    )
-    save_monthly_line_plot(
-        monthly_metrics,
-        "mean_local_complexity_rolling",
-        outdir / "fig_monthly_local_complexity.png",
-        "Monthly Local Complexity",
-        "Rolling Mean Complexity",
-    )
-    save_monthly_line_plot(
-        monthly_metrics,
-        "mean_score_rolling",
-        outdir / "fig_monthly_mean_score.png",
-        "Monthly Mean Meme Score",
-        "Rolling Mean Score",
-    )
-
-    template_summary = compute_template_conditioned_summary(df, top_templates)
-    template_summary.to_csv(outdir / "top_template_semantic_summary.csv", index=False)
-    top_templates.to_csv(outdir / "top_templates_selected.csv", index=False)
-    save_template_bar(
-        template_summary,
-        "mean_alignment",
-        outdir / "fig_top_templates_alignment.png",
-        "Top Templates: Mean Global-Local Alignment",
-        "Mean Similarity",
-        "#457b9d",
-    )
-    save_template_bar(
-        template_summary,
-        "mismatch_rate",
-        outdir / "fig_top_templates_sentiment_mismatch.png",
-        "Top Templates: Dominant Emotion Mismatch Rate",
-        "Dominant Emotion Mismatch Rate",
-        "#e76f51",
-    )
-    save_template_bar(
-        template_summary,
-        "mean_local_complexity",
-        outdir / "fig_top_templates_local_complexity.png",
-        "Top Templates: Local Complexity",
-        "Mean Complexity Index",
-        "#2a9d8f",
-    )
-
-    phase_boundaries, phase_annotated = assign_lifecycle_phases(
-        df,
-        top_templates=top_templates,
-        freq=args.lifecycle_freq,
-        low_frac=args.low_frac,
-        sustain_periods=args.sustain_periods,
-        zero_run_periods=args.zero_run_periods,
-    )
-    phase_boundaries.to_csv(outdir / "top_template_lifecycle_boundaries.csv", index=False)
-    if not phase_annotated.empty:
-        mismatch_column = "emotion_mismatch" if "emotion_mismatch" in phase_annotated.columns else "sentiment_mismatch"
-        phase_summary = (
-            phase_annotated.groupby(["template_final", "template_rank", "lifecycle_phase"], observed=True)
-            .agg(
-                posts=("template_final", "size"),
-                mean_alignment=("global_local_similarity", "mean"),
-                mismatch_rate=(mismatch_column, "mean"),
-                mean_local_complexity=("local_complexity_index", "mean"),
-                mean_score=("score", "mean"),
-            )
-            .reset_index()
+    for context in ("global", "local"):
+        save_score_histogram_grid(
+            df,
+            context=context,
+            outpath=outdir / f"fig_histogram_scores_{context}.png",
+            bins=args.hist_bins,
         )
-    else:
-        phase_summary = pd.DataFrame()
-    phase_summary.to_csv(outdir / "top_template_phase_summary.csv", index=False)
-    save_phase_metric_plot(
-        phase_summary,
-        "mean_alignment",
-        outdir / "fig_phase_alignment.png",
-        "Alignment Across Lifecycle Phases for Top Templates",
-        "Mean Similarity",
-    )
-    save_phase_metric_plot(
-        phase_summary,
-        "mismatch_rate",
-        outdir / "fig_phase_sentiment_mismatch.png",
-        "Dominant Emotion Mismatch Across Lifecycle Phases for Top Templates",
-        "Dominant Emotion Mismatch Rate",
-    )
-    save_phase_metric_plot(
-        phase_summary,
-        "mean_local_complexity",
-        outdir / "fig_phase_local_complexity.png",
-        "Local Complexity Across Lifecycle Phases for Top Templates",
-        "Mean Complexity Index",
-    )
 
-    topic_df, topic_terms, global_topic_summary, local_topic_plus = compute_topic_outputs(
-        df,
-        n_topics=args.n_topics,
-        topic_max_features=args.topic_max_features,
-        topic_min_df=args.topic_min_df,
-        max_docs_fit=args.max_topic_docs_fit,
-        random_seed=args.random_seed,
-        topic_model=args.topic_model,
-        topic_embedding_model=args.topic_embedding_model,
-        bertopic_batch_size=args.bertopic_batch_size,
-    )
-    if not topic_df.empty:
-        df = topic_df
-    topic_terms.to_csv(outdir / "shared_topics_terms.csv", index=False)
-    global_topic_summary.to_csv(outdir / "global_topic_summary.csv", index=False)
-    local_topic_plus.to_csv(outdir / "local_topic_summary_and_transitions_long.csv", index=False)
-    transition_matrix = compute_topic_transition_matrix(df)
-    transition_matrix.to_csv(outdir / "global_to_local_topic_transition.csv")
-    save_heatmap(
-        transition_matrix,
-        outdir / "fig_global_to_local_topic_transition.png",
-        "Global Topic to Local Topic Transition Rates",
-        cmap="YlGnBu",
-        annotate=False,
-    )
-    save_topic_bar(
-        global_topic_summary,
-        "share_global",
-        outdir / "fig_global_topic_prevalence.png",
-        "Top Shared-Space Topics in Global Context",
-    )
-    if not local_topic_plus.empty:
-        local_topic_summary = (
-            local_topic_plus.loc[:, ["topic_id", "share_local", "top_terms"]]
-            .drop_duplicates(subset=["topic_id"])
-            .sort_values("share_local", ascending=False)
+        dominant_df, summary_df = compute_dominant_summary(df, context=context, threshold=args.emotion_threshold)
+        summary_df.to_csv(outdir / f"{context}_dominant_affect_summary.csv", index=False)
+        dominant_df.to_csv(outdir / f"{context}_dominant_affect_rows.csv", index=False)
+
+        save_dominant_proportion_chart(
+            summary_df,
+            context=context,
+            threshold=args.emotion_threshold,
+            outpath=outdir / f"fig_dominant_proportions_{context}.png",
         )
-    else:
-        local_topic_summary = pd.DataFrame()
-    save_topic_bar(
-        local_topic_summary,
-        "share_local",
-        outdir / "fig_local_topic_prevalence.png",
-        "Top Shared-Space Topics in Local Context",
-    )
-
-    if not phase_annotated.empty:
-        global_phase_terms = top_terms_by_group(
-            phase_annotated["global_text"],
-            phase_annotated["lifecycle_phase"],
-            top_n=args.keyword_top_n,
-            max_features=args.topic_max_features,
-            min_df=max(3, min(args.topic_min_df, 5)),
+        save_dominant_score_overlay(
+            dominant_df,
+            summary_df,
+            context=context,
+            threshold=args.emotion_threshold,
+            outpath=outdir / f"fig_dominant_score_distribution_{context}.png",
+            bins=args.hist_bins,
+            top_n=args.dominant_top_n,
         )
-        local_phase_terms = top_terms_by_group(
-            phase_annotated["local_text"],
-            phase_annotated["lifecycle_phase"],
-            top_n=args.keyword_top_n,
-            max_features=args.topic_max_features,
-            min_df=max(3, min(args.topic_min_df, 5)),
+        save_mean_dominant_score_chart(
+            summary_df,
+            context=context,
+            threshold=args.emotion_threshold,
+            outpath=outdir / f"fig_mean_dominant_scores_{context}.png",
         )
-    else:
-        global_phase_terms = pd.DataFrame()
-        local_phase_terms = pd.DataFrame()
-    global_phase_terms.to_csv(outdir / "global_phase_keywords.csv", index=False)
-    local_phase_terms.to_csv(outdir / "local_phase_keywords.csv", index=False)
-    save_group_term_plot(
-        global_phase_terms,
-        outdir / "fig_global_phase_keywords.png",
-        "Top Global Terms by Lifecycle Phase",
-    )
-    save_group_term_plot(
-        local_phase_terms,
-        outdir / "fig_local_phase_keywords.png",
-        "Top Local Terms by Lifecycle Phase",
-    )
-
-    save_complexity_vs_score(df, outdir / "fig_local_complexity_vs_score.png")
-    save_alignment_vs_score(df, outdir / "fig_alignment_vs_score.png")
-
-    if not top_templates.empty:
-        top_set = set(top_templates["template_final"])
-        top_monthly = (
-            df[df["template_final"].isin(top_set)]
-            .groupby(["year_month", "template_final"], observed=True)
-            .agg(
-                posts=("template_final", "size"),
-                mean_alignment=("global_local_similarity", "mean"),
-                mean_local_complexity=("local_complexity_index", "mean"),
-            )
-            .reset_index()
+        saved_clouds, grid_clouds, used_keyword_backend = save_wordclouds(
+            dominant_df=dominant_df,
+            summary_df=summary_df,
+            context=context,
+            threshold=args.emotion_threshold,
+            outdir=outdir,
+            max_words=args.wordcloud_max_words,
+            min_token_len=args.wordcloud_min_token_len,
+            keyword_backend=args.keyword_backend,
+            keyword_embedding_model=args.keyword_embedding_model,
+            keyword_max_docs_per_class=args.keyword_max_docs_per_class,
+            random_seed=args.random_seed,
         )
-        top_monthly["month_start"] = pd.PeriodIndex(top_monthly["year_month"], freq="M").to_timestamp()
-        top_monthly = top_monthly.merge(
-            top_templates.loc[:, ["template_final", "template_rank"]],
-            on="template_final",
-            how="left",
-        )
-        top_monthly.to_csv(outdir / "top_template_monthly_metrics.csv", index=False)
+        metadata[f"{context}_dominant_rows"] = int(len(dominant_df))
+        metadata[f"{context}_dominant_labels"] = summary_df["label"].tolist()
+        metadata[f"{context}_wordcloud_count"] = int(saved_clouds)
+        metadata[f"{context}_wordcloud_grid_items"] = int(grid_clouds)
+        metadata[f"{context}_keyword_backend_used"] = used_keyword_backend
 
-        configure_plot_style()
-        fig, axes = plt.subplots(2, 1, figsize=(12, 9), sharex=True)
-        for template_name, group in top_monthly.groupby("template_final", observed=True):
-            rank_value = int(group["template_rank"].iloc[0])
-            label = f"{rank_value}. {template_name}"
-            axes[0].plot(group["month_start"], group["mean_alignment"], linewidth=1.5, label=label)
-            axes[1].plot(group["month_start"], group["mean_local_complexity"], linewidth=1.5, label=label)
-        axes[0].set_title("Top Templates: Monthly Global-Local Alignment")
-        axes[0].set_ylabel("Mean Similarity")
-        axes[1].set_title("Top Templates: Monthly Local Complexity")
-        axes[1].set_ylabel("Mean Complexity")
-        axes[1].set_xlabel("Month")
-        axes[0].legend(loc="upper left", fontsize=8, ncol=2)
-        axes[0].grid(alpha=0.25)
-        axes[1].grid(alpha=0.25)
-        fig.autofmt_xdate()
-        fig.tight_layout()
-        fig.savefig(outdir / "fig_top_template_monthly_semantic_metrics.png", dpi=180)
-        plt.close(fig)
+    if "emotion_mismatch" in df.columns:
+        metadata["emotion_mismatch_rate"] = float(pd.to_numeric(df["emotion_mismatch"], errors="coerce").mean())
+    if "sentiment_mismatch" in df.columns:
+        metadata["sentiment_mismatch_rate"] = float(pd.to_numeric(df["sentiment_mismatch"], errors="coerce").mean())
 
-    pair_melt = pd.DataFrame()
-    if not pair_matrix.empty:
-        pair_melt = pair_matrix.stack().reset_index().rename(columns={0: "count"})
-        pair_melt = pair_melt.sort_values("count", ascending=False).reset_index(drop=True)
-
-    bullets = [
+    summary_lines = [
         f"Rows analyzed: {len(df)}.",
-        f"Top templates analyzed in detail: {len(top_templates)} with ranking='{args.template_ranking}' and min_posts={args.min_template_posts}.",
+        f"Affect backend: {args.emotion_backend}. Dominant-score threshold: {args.emotion_threshold:.2f}.",
         (
-            f"Emotion mismatch rate: {df['emotion_mismatch'].mean():.3f}; "
-            f"sentiment mismatch rate: {df['sentiment_mismatch'].mean():.3f}; "
-            f"mean global-local similarity: {df['global_local_similarity'].dropna().mean():.3f}."
-            if df["global_local_similarity"].notna().any()
-            else "No valid global-local similarity scores were computed."
+            f"Global dominant classes above threshold: {', '.join(metadata['global_dominant_labels'][:8])}."
+            if metadata.get("global_dominant_labels")
+            else "Global dominant classes above threshold: none."
         ),
         (
-            f"Most common paired sentiment transition: "
-            f"{pair_melt.iloc[0, 0]} -> {pair_melt.iloc[0, 1]} ({int(pair_melt.iloc[0, 2])} posts)."
-            if not pair_melt.empty
-            else "No paired sentiment matrix available."
+            f"Local dominant classes above threshold: {', '.join(metadata['local_dominant_labels'][:8])}."
+            if metadata.get("local_dominant_labels")
+            else "Local dominant classes above threshold: none."
         ),
         (
-            f"Most common dominant emotion in global context: {global_dominant.iloc[0]['label']} "
-            f"({int(global_dominant.iloc[0]['count'])} posts); "
-            f"in local context: {local_dominant.iloc[0]['label']} ({int(local_dominant.iloc[0]['count'])} posts)."
-            if not global_dominant.empty and not local_dominant.empty
-            else "Dominant emotion distributions were unavailable."
+            f"Word clouds generated: global={metadata.get('global_wordcloud_count', 0)}, "
+            f"local={metadata.get('local_wordcloud_count', 0)}."
+            if WordCloud is not None
+            else "Word cloud dependency was unavailable, so word-cloud charts were skipped."
         ),
         (
-            f"Lifecycle-phase rows available for top templates: {len(phase_annotated)}."
-            if not phase_annotated.empty
-            else "No lifecycle-phase annotations were generated."
-        ),
-        (
-            f"Shared topic model generated {len(topic_terms)} topics; "
-            f"largest global topic share={global_topic_summary['share_global'].max():.3f}."
-            if not topic_terms.empty and not global_topic_summary.empty
-            else "Topic modeling outputs were unavailable."
+            f"Keyword ranking backend used: global={metadata.get('global_keyword_backend_used', 'none')}, "
+            f"local={metadata.get('local_keyword_backend_used', 'none')}."
         ),
     ]
+    if "emotion_mismatch_rate" in metadata:
+        summary_lines.append(f"Global/local dominant-emotion mismatch rate: {metadata['emotion_mismatch_rate']:.3f}.")
+    if "sentiment_mismatch_rate" in metadata:
+        summary_lines.append(f"Global/local sentiment-label mismatch rate: {metadata['sentiment_mismatch_rate']:.3f}.")
 
-    write_summary_markdown(outdir / "summary.md", "Q2 Global vs Local Context", bullets)
-    write_run_metadata(
-        outdir / "run_metadata.json",
-        {
-            "analysis_parquet": str(Path(args.analysis_parquet).expanduser().resolve()),
-            "results_dir": str(outdir),
-            "rows": int(len(df)),
-            "top_k_templates": int(args.top_k_templates),
-            "min_template_posts": int(args.min_template_posts),
-            "template_ranking": str(args.template_ranking),
-            "alignment_backend": str(df["alignment_backend"].iloc[0]) if len(df) else "none",
-            "emotion_backend": str(args.emotion_backend),
-            "n_topics": int(args.n_topics),
-            "topic_model": str(args.topic_model),
-            "random_seed": int(args.random_seed),
-        },
+    write_run_metadata(outdir / "run_metadata.json", metadata)
+    write_summary_markdown(
+        outdir / "summary.md",
+        "Research Question 2: Global vs Local Affect Charts",
+        summary_lines,
     )
-    print(f"results_dir={outdir}")
     return outdir
 
 
 def main() -> None:
-    run_analysis(parse_args())
+    args = parse_args()
+    outdir = run_analysis(args)
+    print(outdir)
 
 
 if __name__ == "__main__":

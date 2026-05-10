@@ -26,6 +26,21 @@ import pandas as pd
 
 NO_TEMPLATE = "NO_TEMPLATE"
 EXCLUDED_TEMPLATE_LABELS = {NO_TEMPLATE, "NON_MEME", "NO_MEME"}
+LOCAL_DOWNLOADS_DIRNAME = "LOCAL_DOWNLOADS"
+AFFECT_EMOTION_LABELS = [
+    "joy",
+    "anticipation",
+    "disgust",
+    "sadness",
+    "anger",
+    "optimism",
+    "surprise",
+    "pessimism",
+    "fear",
+    "trust",
+    "love",
+]
+AFFECT_SENTIMENT_LABELS = ["neutral", "positive", "negative"]
 
 
 def configure_plot_style() -> None:
@@ -184,9 +199,212 @@ def _read_two_column_csv(path: Path, col1: str, col2: str) -> pd.DataFrame:
     return frame
 
 
-def _parse_topic_id(name: Any) -> pd.Series:
-    text = pd.Series(name, dtype="object").fillna("").astype(str)
-    return pd.to_numeric(text.str.extract(r"^\s*(-?\d+)")[0], errors="coerce").astype("Int64")
+def _resolve_local_downloads_dir(data_dir: str | Path) -> Path:
+    base_dir = Path(data_dir).expanduser().resolve()
+    if base_dir.name == LOCAL_DOWNLOADS_DIRNAME:
+        return base_dir
+    return base_dir / LOCAL_DOWNLOADS_DIRNAME
+
+
+def _bundle_key_from_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and np.isnan(value):
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    return Path(text).stem.strip()
+
+
+def _key_to_bundle_filename(key: str) -> str:
+    normalized = str(key).strip()
+    if not normalized:
+        return ""
+    return f"{normalized}.jpg"
+
+
+def _load_json_object(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected JSON object at {path}")
+    return payload
+
+
+def _json_list_to_text(value: Any) -> str:
+    if isinstance(value, list):
+        return " | ".join(str(item) for item in value if item is not None and str(item).strip())
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _json_list_to_json(value: Any) -> str:
+    if isinstance(value, list):
+        return json.dumps(value, ensure_ascii=True)
+    if value is None:
+        return "[]"
+    if isinstance(value, str):
+        return json.dumps([value], ensure_ascii=True)
+    return json.dumps([str(value)], ensure_ascii=True)
+
+
+def _resolve_parsed_context_jsonl(data_dir: str | Path) -> Path:
+    base_dir = Path(data_dir).expanduser().resolve()
+    if base_dir.name == LOCAL_DOWNLOADS_DIRNAME:
+        return base_dir.parent / "merged_parsed_results_with_template_predictions.jsonl"
+    return base_dir / "merged_parsed_results_with_template_predictions.jsonl"
+
+
+def _load_parsed_context_frame(data_dir: str | Path) -> pd.DataFrame:
+    jsonl_path = _resolve_parsed_context_jsonl(data_dir)
+    if not jsonl_path.exists():
+        columns = [
+            "bundle_key",
+            "global_context_description",
+            "local_context_user_texts_json",
+            "local_context_user_texts_text",
+            "local_context_text_meaning",
+            "local_context_instance_specific_image_description",
+            "global_context_keywords_json",
+            "global_context_keywords_text",
+            "local_context_keywords_json",
+            "local_context_keywords_text",
+        ]
+        return pd.DataFrame(columns=columns)
+
+    rows: list[dict[str, Any]] = []
+    with jsonl_path.open("r", encoding="utf-8") as infile:
+        for line in infile:
+            line = line.strip()
+            if not line:
+                continue
+            payload = json.loads(line)
+            data = payload.get("data")
+            if not isinstance(data, dict):
+                continue
+            local_context = data.get("local_context", {})
+            if not isinstance(local_context, dict):
+                local_context = {}
+            bundle_key = str(payload.get("key", "")).strip()
+            if not bundle_key:
+                continue
+            rows.append(
+                {
+                    "bundle_key": bundle_key,
+                    "global_context_description": data.get("global_context_description", ""),
+                    "local_context_user_texts_json": _json_list_to_json(local_context.get("user_texts")),
+                    "local_context_user_texts_text": _json_list_to_text(local_context.get("user_texts")),
+                    "local_context_text_meaning": local_context.get("text_meaning", ""),
+                    "local_context_instance_specific_image_description": local_context.get(
+                        "instance_specific_image_description",
+                        "",
+                    ),
+                    "global_context_keywords_json": _json_list_to_json(data.get("global_context_keywords")),
+                    "global_context_keywords_text": _json_list_to_text(data.get("global_context_keywords")),
+                    "local_context_keywords_json": _json_list_to_json(data.get("local_context_keywords")),
+                    "local_context_keywords_text": _json_list_to_text(data.get("local_context_keywords")),
+                }
+            )
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "bundle_key",
+                "global_context_description",
+                "local_context_user_texts_json",
+                "local_context_user_texts_text",
+                "local_context_text_meaning",
+                "local_context_instance_specific_image_description",
+                "global_context_keywords_json",
+                "global_context_keywords_text",
+                "local_context_keywords_json",
+                "local_context_keywords_text",
+            ]
+        )
+    return pd.DataFrame(rows).drop_duplicates(subset=["bundle_key"], keep="last").reset_index(drop=True)
+
+
+def _load_local_downloads_sentiment_frame(base_dir: Path, suffix: str) -> pd.DataFrame:
+    payload = _load_json_object(base_dir / f"{suffix}_sentiments.json")
+    rows: list[dict[str, Any]] = []
+    for key, values in payload.items():
+        bundle_key = str(key).strip()
+        if not bundle_key or not isinstance(values, dict):
+            continue
+        row: dict[str, Any] = {
+            "bundle_key": bundle_key,
+            "bundle_filename": _key_to_bundle_filename(bundle_key),
+        }
+        for label in AFFECT_SENTIMENT_LABELS:
+            row[f"{label}_{suffix}"] = values.get(label)
+        rows.append(row)
+    if not rows:
+        return pd.DataFrame(columns=["bundle_key", "bundle_filename", *[f"{label}_{suffix}" for label in AFFECT_SENTIMENT_LABELS]])
+    frame = pd.DataFrame(rows).drop_duplicates(subset=["bundle_key"], keep="last").reset_index(drop=True)
+    for label in AFFECT_SENTIMENT_LABELS:
+        column = f"{label}_{suffix}"
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    return frame
+
+
+def _load_local_downloads_emotion_frame(base_dir: Path, suffix: str) -> pd.DataFrame:
+    payload = _load_json_object(base_dir / f"{suffix}_emotions.json")
+    rows: list[dict[str, Any]] = []
+    for key, values in payload.items():
+        bundle_key = str(key).strip()
+        if not bundle_key or not isinstance(values, list):
+            continue
+        row: dict[str, Any] = {
+            "bundle_key": bundle_key,
+            "bundle_filename": _key_to_bundle_filename(bundle_key),
+        }
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label", "")).strip()
+            if label in AFFECT_EMOTION_LABELS:
+                row[f"{label}_{suffix}"] = item.get("score")
+        rows.append(row)
+    if not rows:
+        return pd.DataFrame(columns=["bundle_key", "bundle_filename", *[f"{label}_{suffix}" for label in AFFECT_EMOTION_LABELS]])
+    frame = pd.DataFrame(rows).drop_duplicates(subset=["bundle_key"], keep="last").reset_index(drop=True)
+    for label in AFFECT_EMOTION_LABELS:
+        column = f"{label}_{suffix}"
+        if column not in frame.columns:
+            frame[column] = np.nan
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    return frame
+
+
+def _load_local_downloads_affect_frame(base_dir: Path, suffix: str) -> pd.DataFrame:
+    sentiment = _load_local_downloads_sentiment_frame(base_dir, suffix)
+    emotions = _load_local_downloads_emotion_frame(base_dir, suffix)
+    if sentiment.empty and emotions.empty:
+        columns = [
+            "bundle_key",
+            "bundle_filename",
+            *[f"{label}_{suffix}" for label in AFFECT_SENTIMENT_LABELS],
+            *[f"{label}_{suffix}" for label in AFFECT_EMOTION_LABELS],
+        ]
+        return pd.DataFrame(columns=columns)
+    if sentiment.empty:
+        frame = emotions.copy()
+    elif emotions.empty:
+        frame = sentiment.copy()
+    else:
+        frame = sentiment.merge(
+            emotions.drop(columns=["bundle_filename"], errors="ignore"),
+            on="bundle_key",
+            how="outer",
+        )
+    if "bundle_filename" not in frame.columns:
+        frame["bundle_filename"] = frame["bundle_key"].map(_key_to_bundle_filename)
+    return frame.drop_duplicates(subset=["bundle_key"], keep="last").reset_index(drop=True)
 
 
 def enrich_with_current_data_bundle(
@@ -194,96 +412,59 @@ def enrich_with_current_data_bundle(
     data_dir: str | Path,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     out = df.copy()
-    base_dir = Path(data_dir).expanduser().resolve()
+    base_dir = _resolve_local_downloads_dir(data_dir)
     metadata: dict[str, Any] = {"current_data_bundle_dir": str(base_dir)}
 
     out["bundle_filename"] = out.apply(image_basename_from_row, axis=1)
-    bundle_filename_set = set(out["bundle_filename"].astype(str))
+    out["bundle_key"] = out["bundle_filename"].map(_bundle_key_from_value)
+    if "key" in out.columns:
+        out["bundle_key"] = out["bundle_key"].where(
+            out["bundle_key"].astype(str).str.strip().ne(""),
+            out["key"].fillna("").astype(str).map(_bundle_key_from_value),
+        )
 
-    metadata_path = base_dir / "metadata_Reddit.csv"
-    if metadata_path.exists():
-        meta = pd.read_csv(metadata_path)
-        if {"Filename", "score", "created_utc"}.issubset(meta.columns):
-            meta["Filename"] = meta["Filename"].astype(str)
-            meta = meta.drop_duplicates(subset=["Filename"], keep="last")
-            out = out.merge(
-                meta.rename(columns={"score": "bundle_score", "created_utc": "bundle_created_utc"}),
-                left_on="bundle_filename",
-                right_on="Filename",
-                how="left",
-            ).drop(columns=["Filename"])
-            overlap = out["bundle_score"].notna().sum()
-            metadata["bundle_metadata_overlap_rows"] = int(overlap)
-            metadata["bundle_metadata_base_coverage"] = float(overlap / max(len(out), 1))
-        else:
-            metadata["bundle_metadata_overlap_rows"] = 0
-            metadata["bundle_metadata_base_coverage"] = 0.0
+    metadata["bundle_metadata_overlap_rows"] = 0
+    metadata["bundle_metadata_base_coverage"] = 0.0
+    metadata["bundle_global_context_overlap_rows"] = 0
+    metadata["bundle_local_context_overlap_rows"] = 0
+    metadata["bundle_local_text_length_overlap_rows"] = 0
 
-    global_context_path = base_dir / "global_context.csv"
-    if global_context_path.exists():
-        global_context = _read_two_column_csv(global_context_path, "bundle_filename", "bundle_global_context_text")
-        out = out.merge(global_context, on="bundle_filename", how="left")
-        metadata["bundle_global_context_overlap_rows"] = int(out["bundle_global_context_text"].notna().sum())
-        if "global_text" in out.columns:
-            out["global_text"] = out["bundle_global_context_text"].fillna(out["global_text"])
+    parsed_context_df = _load_parsed_context_frame(data_dir)
+    metadata["bundle_parsed_context_rows"] = int(len(parsed_context_df))
+    if not parsed_context_df.empty:
+        out = out.merge(parsed_context_df, on="bundle_key", how="left")
+        metadata["bundle_global_context_overlap_rows"] = int(
+            out["global_context_description"].fillna("").astype(str).str.strip().ne("").sum()
+        )
+        metadata["bundle_local_context_overlap_rows"] = int(
+            (
+                out["local_context_user_texts_text"].fillna("").astype(str).str.strip().ne("")
+                | out["local_context_text_meaning"].fillna("").astype(str).str.strip().ne("")
+                | out["local_context_instance_specific_image_description"].fillna("").astype(str).str.strip().ne("")
+            ).sum()
+        )
 
-    local_context_path = base_dir / "local_context.csv"
-    if local_context_path.exists():
-        local_context = _read_two_column_csv(local_context_path, "bundle_filename", "bundle_local_context_text")
-        out = out.merge(local_context, on="bundle_filename", how="left")
-        metadata["bundle_local_context_overlap_rows"] = int(out["bundle_local_context_text"].notna().sum())
-        if "local_text" in out.columns:
-            out["local_text"] = out["bundle_local_context_text"].fillna(out["local_text"])
-
-    local_text_length_path = base_dir / "local_text_length.csv"
-    if local_text_length_path.exists():
-        local_text_length = pd.read_csv(local_text_length_path)
-        if {"Filename", "text_length"}.issubset(local_text_length.columns):
-            local_text_length = (
-                local_text_length.loc[:, ["Filename", "text_length"]]
-                .rename(columns={"Filename": "bundle_filename", "text_length": "bundle_local_text_length"})
-                .drop_duplicates(subset=["bundle_filename"], keep="last")
-            )
-            out = out.merge(local_text_length, on="bundle_filename", how="left")
-
-    affect_labels = [
-        "joy",
-        "anticipation",
-        "disgust",
-        "sadness",
-        "anger",
-        "optimism",
-        "surprise",
-        "pessimism",
-        "fear",
-        "trust",
-        "love",
-        "neutral",
-        "positive",
-        "negative",
-    ]
-    for path, suffix, text_col_name in [
-        (base_dir / "sentiment_global.csv", "global", "bundle_global_affect_text"),
-        (base_dir / "sentiment_local.csv", "local", "bundle_local_affect_text"),
-    ]:
-        if not path.exists():
+    for suffix in ["global", "local"]:
+        affect_df = _load_local_downloads_affect_frame(base_dir, suffix)
+        metadata[f"bundle_sentiment_{suffix}_rows"] = int(
+            affect_df[f"positive_{suffix}"].notna().sum()
+        ) if f"positive_{suffix}" in affect_df.columns else 0
+        metadata[f"bundle_emotion_{suffix}_rows"] = int(
+            affect_df[[f"{label}_{suffix}" for label in AFFECT_EMOTION_LABELS if f"{label}_{suffix}" in affect_df.columns]]
+            .notna()
+            .any(axis=1)
+            .sum()
+        ) if any(f"{label}_{suffix}" in affect_df.columns for label in AFFECT_EMOTION_LABELS) else 0
+        if affect_df.empty:
             continue
-        affect_df = pd.read_csv(path)
-        if "Filename" not in affect_df.columns:
-            continue
-        rename_map = {"Filename": "bundle_filename"}
-        if suffix == "global" and "Caption" in affect_df.columns:
-            rename_map["Caption"] = text_col_name
-        if suffix == "local" and "Extracted Text + Title" in affect_df.columns:
-            rename_map["Extracted Text + Title"] = text_col_name
-        for label in affect_labels:
-            if label in affect_df.columns:
-                rename_map[label] = f"{label}_{suffix}"
-        affect_df = affect_df.rename(columns=rename_map)
-        keep_cols = ["bundle_filename"] + [col for col in [text_col_name, *[f"{label}_{suffix}" for label in affect_labels]] if col in affect_df.columns]
-        affect_df = affect_df.loc[:, keep_cols].drop_duplicates(subset=["bundle_filename"], keep="last")
-        out = out.merge(affect_df, on="bundle_filename", how="left")
-        metadata[f"bundle_sentiment_{suffix}_overlap_rows"] = int(out[f"positive_{suffix}"].notna().sum()) if f"positive_{suffix}" in out.columns else 0
+        out = out.merge(
+            affect_df.drop(columns=["bundle_filename"], errors="ignore"),
+            on="bundle_key",
+            how="left",
+        )
+        metadata[f"bundle_sentiment_{suffix}_overlap_rows"] = int(
+            out[f"positive_{suffix}"].notna().sum()
+        ) if f"positive_{suffix}" in out.columns else 0
 
     if {"positive_global", "negative_global"}.issubset(out.columns):
         out["global_sentiment_score_precomputed"] = (
@@ -296,162 +477,84 @@ def enrich_with_current_data_bundle(
             - pd.to_numeric(out["negative_local"], errors="coerce").fillna(0.0)
         )
 
-    if global_context_path.exists() and (base_dir / "topic_global_context.csv").exists():
-        global_context = _read_two_column_csv(global_context_path, "bundle_filename", "Document")
-        global_topics = pd.read_csv(base_dir / "topic_global_context.csv")
-        if {"Document", "Name", "Probability"}.issubset(global_topics.columns):
-            global_topics = global_topics.drop_duplicates(subset=["Document"], keep="last")
-            global_topic_lookup = global_context.merge(global_topics, on="Document", how="left")
-            global_topic_lookup = global_topic_lookup.rename(
-                columns={
-                    "Name": "global_topic_name",
-                    "Probability": "global_topic_probability",
-                }
-            )
-            global_topic_lookup["global_topic"] = _parse_topic_id(global_topic_lookup["global_topic_name"])
-            global_topic_lookup = global_topic_lookup.loc[
-                :, ["bundle_filename", "global_topic", "global_topic_name", "global_topic_probability"]
-            ].drop_duplicates(subset=["bundle_filename"], keep="last")
-            out = out.merge(global_topic_lookup, on="bundle_filename", how="left")
-
-    if local_context_path.exists() and (base_dir / "topic_local_context.csv").exists():
-        local_context = _read_two_column_csv(local_context_path, "bundle_filename", "Document")
-        local_topics = pd.read_csv(base_dir / "topic_local_context.csv")
-        if {"Document", "Name", "Probability"}.issubset(local_topics.columns):
-            local_topics = local_topics.drop_duplicates(subset=["Document"], keep="last")
-            local_topic_lookup = local_context.merge(local_topics, on="Document", how="left")
-            local_topic_lookup = local_topic_lookup.rename(
-                columns={
-                    "Name": "local_topic_name",
-                    "Probability": "local_topic_probability",
-                }
-            )
-            local_topic_lookup["local_topic"] = _parse_topic_id(local_topic_lookup["local_topic_name"])
-            local_topic_lookup = local_topic_lookup.loc[
-                :, ["bundle_filename", "local_topic", "local_topic_name", "local_topic_probability"]
-            ].drop_duplicates(subset=["bundle_filename"], keep="last")
-            out = out.merge(local_topic_lookup, on="bundle_filename", how="left")
-
-    usage_result_path = base_dir / "usage_result.csv"
-    if usage_result_path.exists():
-        usage_df = _read_two_column_csv(usage_result_path, "usage_asset_name", "usage_labels")
-        usage_df["usage_template_stub"] = usage_df["usage_asset_name"].astype(str).str.replace(r"_[0-9]+\.[A-Za-z0-9]+$", "", regex=True)
-        usage_df["usage_template_stub"] = usage_df["usage_template_stub"].str.replace(r"\.[A-Za-z0-9]+$", "", regex=True)
-        usage_df = usage_df.drop_duplicates(subset=["usage_asset_name"], keep="first")
-        metadata["bundle_usage_rows"] = int(len(usage_df))
-
     metadata["bundle_filename_nonempty_rows"] = int(out["bundle_filename"].astype(str).str.strip().ne("").sum())
     metadata["bundle_filename_unique"] = int(out["bundle_filename"].astype(str).nunique())
     metadata["bundle_filename_base_matchable_rows"] = int(
-        sum(name in bundle_filename_set for name in out["bundle_filename"].astype(str).unique())
+        out["bundle_key"].astype(str).str.strip().ne("").sum()
     )
-    return out, metadata
+    metadata["bundle_base_unique_keys"] = int(
+        out["bundle_key"].astype(str).str.strip().nunique()
+    )
+    return out.drop(columns=["bundle_key"], errors="ignore"), metadata
 
 
 def build_current_data_bundle_raw(data_dir: str | Path) -> tuple[pd.DataFrame, dict[str, Any]]:
-    base_dir = Path(data_dir).expanduser().resolve()
+    base_dir = _resolve_local_downloads_dir(data_dir)
     metadata: dict[str, Any] = {"current_data_bundle_dir": str(base_dir)}
 
     filename_parts: list[pd.Series] = []
+    metadata["bundle_source"] = "LOCAL_DOWNLOADS"
+    metadata["bundle_metadata_rows"] = 0
+    metadata["bundle_local_text_length_rows"] = 0
+    parsed_context_df = _load_parsed_context_frame(data_dir)
+    metadata["bundle_parsed_context_rows"] = int(len(parsed_context_df))
+    metadata["bundle_global_context_rows"] = int(
+        parsed_context_df["global_context_description"].fillna("").astype(str).str.strip().ne("").sum()
+    ) if "global_context_description" in parsed_context_df.columns else 0
+    metadata["bundle_local_context_rows"] = int(
+        (
+            parsed_context_df.get("local_context_user_texts_text", pd.Series(dtype="object")).fillna("").astype(str).str.strip().ne("")
+            | parsed_context_df.get("local_context_text_meaning", pd.Series(dtype="object")).fillna("").astype(str).str.strip().ne("")
+            | parsed_context_df.get("local_context_instance_specific_image_description", pd.Series(dtype="object")).fillna("").astype(str).str.strip().ne("")
+        ).sum()
+    ) if not parsed_context_df.empty else 0
 
-    metadata_path = base_dir / "metadata_Reddit.csv"
-    metadata_df = pd.DataFrame(columns=["bundle_filename", "score", "created_utc"])
-    if metadata_path.exists():
-        meta = pd.read_csv(metadata_path)
-        if {"Filename", "score", "created_utc"}.issubset(meta.columns):
-            metadata_df = (
-                meta.loc[:, ["Filename", "score", "created_utc"]]
-                .rename(columns={"Filename": "bundle_filename"})
-                .drop_duplicates(subset=["bundle_filename"], keep="last")
-            )
-            filename_parts.append(metadata_df["bundle_filename"])
-    metadata["bundle_metadata_rows"] = int(len(metadata_df))
+    metadata_df = pd.DataFrame(columns=["bundle_key", "bundle_filename", "score", "created_utc"])
+    global_context_df = pd.DataFrame(columns=["bundle_key", "bundle_filename", "global_context_description"])
+    local_context_df = pd.DataFrame(columns=["bundle_key", "bundle_filename", "local_context_user_texts_text"])
+    local_text_length_df = pd.DataFrame(columns=["bundle_key", "bundle_filename", "bundle_local_text_length"])
+    context_frame = parsed_context_df.copy()
+    if not context_frame.empty:
+        context_frame["bundle_filename"] = context_frame["bundle_key"].map(_key_to_bundle_filename)
+        filename_parts.append(context_frame["bundle_key"])
 
-    global_context_path = base_dir / "global_context.csv"
-    global_context_df = pd.DataFrame(columns=["bundle_filename", "global_context_description"])
-    if global_context_path.exists():
-        global_context_df = _read_two_column_csv(global_context_path, "bundle_filename", "global_context_description")
-        filename_parts.append(global_context_df["bundle_filename"])
-    metadata["bundle_global_context_rows"] = int(len(global_context_df))
-
-    local_context_path = base_dir / "local_context.csv"
-    local_context_df = pd.DataFrame(columns=["bundle_filename", "local_context_user_texts_text"])
-    if local_context_path.exists():
-        local_context_df = _read_two_column_csv(local_context_path, "bundle_filename", "local_context_user_texts_text")
-        filename_parts.append(local_context_df["bundle_filename"])
-    metadata["bundle_local_context_rows"] = int(len(local_context_df))
-
-    local_text_length_path = base_dir / "local_text_length.csv"
-    local_text_length_df = pd.DataFrame(columns=["bundle_filename", "bundle_local_text_length"])
-    if local_text_length_path.exists():
-        local_text_length = pd.read_csv(local_text_length_path)
-        if {"Filename", "text_length"}.issubset(local_text_length.columns):
-            local_text_length_df = (
-                local_text_length.loc[:, ["Filename", "text_length"]]
-                .rename(columns={"Filename": "bundle_filename", "text_length": "bundle_local_text_length"})
-                .drop_duplicates(subset=["bundle_filename"], keep="last")
-            )
-            filename_parts.append(local_text_length_df["bundle_filename"])
-    metadata["bundle_local_text_length_rows"] = int(len(local_text_length_df))
-
-    affect_labels = [
-        "joy",
-        "anticipation",
-        "disgust",
-        "sadness",
-        "anger",
-        "optimism",
-        "surprise",
-        "pessimism",
-        "fear",
-        "trust",
-        "love",
-        "neutral",
-        "positive",
-        "negative",
-    ]
     affect_frames: dict[str, pd.DataFrame] = {}
-    for path, suffix, text_col_name in [
-        (base_dir / "sentiment_global.csv", "global", "bundle_global_affect_text"),
-        (base_dir / "sentiment_local.csv", "local", "bundle_local_affect_text"),
-    ]:
-        affect_df = pd.DataFrame(columns=["bundle_filename"])
-        if path.exists():
-            source = pd.read_csv(path)
-            if "Filename" in source.columns:
-                rename_map = {"Filename": "bundle_filename"}
-                if suffix == "global" and "Caption" in source.columns:
-                    rename_map["Caption"] = text_col_name
-                if suffix == "local" and "Extracted Text + Title" in source.columns:
-                    rename_map["Extracted Text + Title"] = text_col_name
-                for label in affect_labels:
-                    if label in source.columns:
-                        rename_map[label] = f"{label}_{suffix}"
-                source = source.rename(columns=rename_map)
-                keep_cols = ["bundle_filename"] + [
-                    col
-                    for col in [text_col_name, *[f"{label}_{suffix}" for label in affect_labels]]
-                    if col in source.columns
-                ]
-                affect_df = source.loc[:, keep_cols].drop_duplicates(subset=["bundle_filename"], keep="last")
-                filename_parts.append(affect_df["bundle_filename"])
+    for suffix in ["global", "local"]:
+        affect_df = _load_local_downloads_affect_frame(base_dir, suffix)
+        if not affect_df.empty:
+            filename_parts.append(affect_df["bundle_key"])
         affect_frames[suffix] = affect_df
-        metadata[f"bundle_sentiment_{suffix}_rows"] = int(len(affect_df))
+        metadata[f"bundle_sentiment_{suffix}_rows"] = int(
+            affect_df[f"positive_{suffix}"].notna().sum()
+        ) if f"positive_{suffix}" in affect_df.columns else 0
+        metadata[f"bundle_emotion_{suffix}_rows"] = int(
+            affect_df[[f"{label}_{suffix}" for label in AFFECT_EMOTION_LABELS if f"{label}_{suffix}" in affect_df.columns]]
+            .notna()
+            .any(axis=1)
+            .sum()
+        ) if any(f"{label}_{suffix}" in affect_df.columns for label in AFFECT_EMOTION_LABELS) else 0
 
     if filename_parts:
-        filenames = pd.concat(filename_parts, ignore_index=True).fillna("").astype(str)
-        filenames = filenames[filenames.str.strip().ne("")]
-        base = pd.DataFrame({"bundle_filename": filenames.drop_duplicates().tolist()})
+        keys = pd.concat(filename_parts, ignore_index=True).fillna("").astype(str)
+        keys = keys[keys.str.strip().ne("")]
+        base = pd.DataFrame({"bundle_key": keys.drop_duplicates().tolist()})
+        base["bundle_filename"] = base["bundle_key"].map(_key_to_bundle_filename)
     else:
-        base = pd.DataFrame(columns=["bundle_filename"])
+        base = pd.DataFrame(columns=["bundle_key", "bundle_filename"])
 
-    for frame in [metadata_df, global_context_df, local_context_df, local_text_length_df, *affect_frames.values()]:
+    for frame in [metadata_df, global_context_df, local_context_df, local_text_length_df, context_frame, *affect_frames.values()]:
         if frame.empty:
             continue
-        base = base.merge(frame, on="bundle_filename", how="left")
+        base = base.merge(
+            frame.drop(columns=["bundle_filename"], errors="ignore"),
+            on="bundle_key",
+            how="left",
+        )
 
-    base["key"] = base["bundle_filename"].astype(str).str.replace(r"\.[A-Za-z0-9]+$", "", regex=True)
+    base["key"] = base["bundle_key"].astype(str)
     base["image_path"] = base["bundle_filename"].astype(str)
+    base["score"] = pd.to_numeric(base.get("score"), errors="coerce")
+    base["created_utc"] = pd.to_datetime(base.get("created_utc"), errors="coerce", utc=True)
     base["template_original"] = NO_TEMPLATE
     base["pred_template"] = NO_TEMPLATE
     base["template_final_existing"] = NO_TEMPLATE
@@ -467,18 +570,26 @@ def build_current_data_bundle_raw(data_dir: str | Path) -> tuple[pd.DataFrame, d
     base["assignment_method"] = ""
     base["cluster_method"] = ""
     base["reducer"] = ""
-    base["title"] = ""
-    base["body"] = ""
-    base["url"] = ""
-    base["image_url"] = ""
-    base["post_link"] = ""
-    base["global_context_keywords_json"] = "[]"
-    base["global_context_keywords_text"] = ""
-    base["local_context_keywords_json"] = "[]"
-    base["local_context_keywords_text"] = ""
-    base["local_context_user_texts_json"] = "[]"
-    base["local_context_text_meaning"] = ""
-    base["local_context_instance_specific_image_description"] = ""
+    for column, default in [
+        ("title", ""),
+        ("body", ""),
+        ("url", ""),
+        ("image_url", ""),
+        ("post_link", ""),
+        ("global_context_description", ""),
+        ("global_context_keywords_json", "[]"),
+        ("global_context_keywords_text", ""),
+        ("local_context_keywords_json", "[]"),
+        ("local_context_keywords_text", ""),
+        ("local_context_user_texts_json", "[]"),
+        ("local_context_user_texts_text", ""),
+        ("local_context_text_meaning", ""),
+        ("local_context_instance_specific_image_description", ""),
+    ]:
+        if column not in base.columns:
+            base[column] = default
+        else:
+            base[column] = base[column].fillna(default)
 
     if {"positive_global", "negative_global"}.issubset(base.columns):
         base["global_sentiment_score_precomputed"] = (
@@ -491,59 +602,9 @@ def build_current_data_bundle_raw(data_dir: str | Path) -> tuple[pd.DataFrame, d
             - pd.to_numeric(base["negative_local"], errors="coerce").fillna(0.0)
         )
 
-    if not global_context_df.empty and (base_dir / "topic_global_context.csv").exists():
-        global_topics = pd.read_csv(base_dir / "topic_global_context.csv")
-        if {"Document", "Name", "Probability"}.issubset(global_topics.columns):
-            global_topics = global_topics.drop_duplicates(subset=["Document"], keep="last")
-            global_lookup = global_context_df.rename(columns={"global_context_description": "Document"}).merge(
-                global_topics,
-                on="Document",
-                how="left",
-            )
-            global_lookup = global_lookup.rename(
-                columns={"Name": "global_topic_name", "Probability": "global_topic_probability"}
-            )
-            global_lookup["global_topic"] = _parse_topic_id(global_lookup["global_topic_name"])
-            global_lookup = global_lookup.loc[
-                :, ["bundle_filename", "global_topic", "global_topic_name", "global_topic_probability"]
-            ].drop_duplicates(subset=["bundle_filename"], keep="last")
-            base = base.merge(global_lookup, on="bundle_filename", how="left")
-            metadata["bundle_global_topic_rows"] = int(global_lookup["global_topic_name"].notna().sum())
-
-    if not local_context_df.empty and (base_dir / "topic_local_context.csv").exists():
-        local_topics = pd.read_csv(base_dir / "topic_local_context.csv")
-        if {"Document", "Name", "Probability"}.issubset(local_topics.columns):
-            local_topics = local_topics.drop_duplicates(subset=["Document"], keep="last")
-            local_lookup = local_context_df.rename(columns={"local_context_user_texts_text": "Document"}).merge(
-                local_topics,
-                on="Document",
-                how="left",
-            )
-            local_lookup = local_lookup.rename(
-                columns={"Name": "local_topic_name", "Probability": "local_topic_probability"}
-            )
-            local_lookup["local_topic"] = _parse_topic_id(local_lookup["local_topic_name"])
-            local_lookup = local_lookup.loc[
-                :, ["bundle_filename", "local_topic", "local_topic_name", "local_topic_probability"]
-            ].drop_duplicates(subset=["bundle_filename"], keep="last")
-            base = base.merge(local_lookup, on="bundle_filename", how="left")
-            metadata["bundle_local_topic_rows"] = int(local_lookup["local_topic_name"].notna().sum())
-
-    usage_result_path = base_dir / "usage_result.csv"
-    if usage_result_path.exists():
-        usage_df = _read_two_column_csv(usage_result_path, "usage_asset_name", "usage_labels")
-        usage_df["usage_template_stub"] = usage_df["usage_asset_name"].astype(str).str.replace(
-            r"_[0-9]+\.[A-Za-z0-9]+$",
-            "",
-            regex=True,
-        )
-        usage_df["usage_template_stub"] = usage_df["usage_template_stub"].str.replace(r"\.[A-Za-z0-9]+$", "", regex=True)
-        usage_df = usage_df.drop_duplicates(subset=["usage_asset_name"], keep="first")
-        metadata["bundle_usage_rows"] = int(len(usage_df))
-
     metadata["bundle_base_rows"] = int(len(base))
     metadata["bundle_base_unique_keys"] = int(base["key"].astype(str).nunique())
-    return base, metadata
+    return base.drop(columns=["bundle_key"], errors="ignore"), metadata
 
 
 def load_current_data_bundle_analysis_dataframe(

@@ -202,6 +202,32 @@ def make_loader(dataset: Dataset, batch_size: int, num_workers: int, shuffle: bo
     )
 
 
+def load_torch_state(path: Path) -> dict[str, torch.Tensor]:
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def validate_or_write_label_mapping(run_dir: Path, label_to_idx: dict[str, int], reuse_checkpoint_dir: Path | None) -> None:
+    mapping_path = run_dir / "label_to_idx.json"
+    if reuse_checkpoint_dir is not None:
+        source_mapping_path = reuse_checkpoint_dir / "label_to_idx.json"
+        if not source_mapping_path.exists():
+            raise FileNotFoundError(f"Missing label mapping for reused checkpoint: {source_mapping_path}")
+        source_mapping = json.loads(source_mapping_path.read_text())
+        if source_mapping != label_to_idx:
+            raise ValueError(
+                "Cannot reuse first-seed CNN checkpoint because the label mapping differs for this seed. "
+                "Use fixed train/test parquet files or keep the same filtered class set across seeds."
+            )
+    mapping_path.write_text(json.dumps(label_to_idx, indent=2))
+
+
+def model_output_dir(output_dir: Path, model_name: str) -> Path:
+    return output_dir if output_dir.name == model_name else output_dir / model_name
+
+
 def evaluate_model(
     model: nn.Module,
     loader: DataLoader,
@@ -240,7 +266,11 @@ def evaluate_model(
     )
 
 
-def run_once(cfg: RunConfig, run_dir: Path) -> dict[str, float | int | str]:
+def run_once(
+    cfg: RunConfig,
+    run_dir: Path,
+    reuse_checkpoint_dir: Path | None = None,
+) -> dict[str, float | int | str]:
     set_seed(cfg.random_seed)
     run_started_at = now_iso()
     start_perf = time.perf_counter()
@@ -284,6 +314,7 @@ def run_once(cfg: RunConfig, run_dir: Path) -> dict[str, float | int | str]:
     templates = sorted(train_df["template"].unique().tolist())
     label_to_idx = {label: idx for idx, label in enumerate(templates)}
     idx_to_label = {idx: label for label, idx in label_to_idx.items()}
+    validate_or_write_label_mapping(run_dir, label_to_idx, reuse_checkpoint_dir)
 
     train_transform, eval_transform = build_transforms()
     train_loader = make_loader(
@@ -320,53 +351,62 @@ def run_once(cfg: RunConfig, run_dir: Path) -> dict[str, float | int | str]:
     epochs_without_improvement = 0
     history: list[dict[str, float]] = []
 
-    for epoch in range(cfg.epochs):
-        model.train()
-        running_loss = 0.0
-        seen = 0
-        progress = tqdm(train_loader, desc=f"train epoch {epoch + 1}/{cfg.epochs}")
-        for images, targets, _ in progress:
-            images = images.to(device)
-            targets = targets.to(device)
-            optimizer.zero_grad(set_to_none=True)
-            logits = model(images)
-            loss = loss_fn(logits, targets)
-            loss.backward()
-            optimizer.step()
+    if reuse_checkpoint_dir is None:
+        for epoch in range(cfg.epochs):
+            model.train()
+            running_loss = 0.0
+            seen = 0
+            progress = tqdm(train_loader, desc=f"train epoch {epoch + 1}/{cfg.epochs}")
+            for images, targets, _ in progress:
+                images = images.to(device)
+                targets = targets.to(device)
+                optimizer.zero_grad(set_to_none=True)
+                logits = model(images)
+                loss = loss_fn(logits, targets)
+                loss.backward()
+                optimizer.step()
 
-            running_loss += float(loss.item()) * images.shape[0]
-            seen += int(images.shape[0])
-            progress.set_postfix(train_loss=f"{running_loss / max(seen, 1):.4f}")
+                running_loss += float(loss.item()) * images.shape[0]
+                seen += int(images.shape[0])
+                progress.set_postfix(train_loss=f"{running_loss / max(seen, 1):.4f}")
 
-        train_loss = running_loss / max(seen, 1)
-        val_loss, _, val_preds, val_targets, _ = evaluate_model(model, val_loader, device, loss_fn)
-        val_metrics = compute_metrics(
-            np.array([idx_to_label[int(i)] for i in val_targets]),
-            np.array([idx_to_label[int(i)] for i in val_preds]),
-        )
-        epoch_summary = {
-            "epoch": epoch + 1,
-            "train_loss": float(train_loss),
-            "val_loss": float(val_loss),
-            "val_accuracy": float(val_metrics["accuracy"]),
-            "val_f1": float(val_metrics["f1"]),
-        }
-        history.append(epoch_summary)
-        print(epoch_summary)
+            train_loss = running_loss / max(seen, 1)
+            val_loss, _, val_preds, val_targets, _ = evaluate_model(model, val_loader, device, loss_fn)
+            val_metrics = compute_metrics(
+                np.array([idx_to_label[int(i)] for i in val_targets]),
+                np.array([idx_to_label[int(i)] for i in val_preds]),
+            )
+            epoch_summary = {
+                "epoch": epoch + 1,
+                "train_loss": float(train_loss),
+                "val_loss": float(val_loss),
+                "val_accuracy": float(val_metrics["accuracy"]),
+                "val_f1": float(val_metrics["f1"]),
+            }
+            history.append(epoch_summary)
+            print(epoch_summary)
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_epoch = epoch + 1
-            best_state = {name: tensor.detach().cpu() for name, tensor in model.state_dict().items()}
-            epochs_without_improvement = 0
-        else:
-            epochs_without_improvement += 1
-            if epochs_without_improvement >= cfg.patience:
-                print(f"Early stopping at epoch {epoch + 1}.")
-                break
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_epoch = epoch + 1
+                best_state = {name: tensor.detach().cpu() for name, tensor in model.state_dict().items()}
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+                if epochs_without_improvement >= cfg.patience:
+                    print(f"Early stopping at epoch {epoch + 1}.")
+                    break
 
-    if best_state is None:
-        raise RuntimeError("Training did not produce a valid checkpoint.")
+        if best_state is None:
+            raise RuntimeError("Training did not produce a valid checkpoint.")
+    else:
+        checkpoint_path = reuse_checkpoint_dir / "best_model.pt"
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Cannot reuse missing CNN checkpoint: {checkpoint_path}")
+        print(f"reusing_checkpoint={checkpoint_path}")
+        best_state = load_torch_state(checkpoint_path)
+        best_val_loss = float("nan")
+        best_epoch = 0
 
     model.load_state_dict(best_state)
     torch.save(best_state, run_dir / "best_model.pt")
@@ -403,6 +443,8 @@ def run_once(cfg: RunConfig, run_dir: Path) -> dict[str, float | int | str]:
             "small_class_filtering": filtering_summary,
         },
         "training": {
+            "reused_checkpoint": reuse_checkpoint_dir is not None,
+            "checkpoint_source": None if reuse_checkpoint_dir is None else str(reuse_checkpoint_dir / "best_model.pt"),
             "best_epoch": int(best_epoch),
             "best_val_loss": float(best_val_loss),
             "history": history,
@@ -416,6 +458,7 @@ def run_once(cfg: RunConfig, run_dir: Path) -> dict[str, float | int | str]:
         "run_dir": str(run_dir),
         "seed": int(cfg.random_seed),
         "model_name": cfg.model_name,
+        "reused_checkpoint": reuse_checkpoint_dir is not None,
         "accuracy": float(metrics["accuracy"]),
         "precision": float(metrics["precision"]),
         "recall": float(metrics["recall"]),
@@ -443,27 +486,36 @@ def run_once(cfg: RunConfig, run_dir: Path) -> dict[str, float | int | str]:
 def main() -> None:
     cfg = parse_args()
     seed_values = cfg.seeds if cfg.seeds is not None else (cfg.random_seed,)
+    output_dir = model_output_dir(cfg.output_dir, cfg.model_name)
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     if len(seed_values) == 1:
         single_cfg = RunConfig(**{**asdict(cfg), "random_seed": int(seed_values[0]), "seeds": None})
-        run_once(single_cfg, cfg.output_dir / timestamp)
+        run_once(single_cfg, output_dir / timestamp)
         return
 
-    batch_dir = cfg.output_dir / f"{timestamp}_batch"
+    batch_dir = output_dir / f"{timestamp}_batch"
     batch_dir.mkdir(parents=True, exist_ok=True)
     batch_rows: list[dict[str, float | int | str]] = []
+    first_seed = int(seed_values[0])
+    first_run_dir = batch_dir / f"seed_{first_seed}"
     for seed in seed_values:
         print(f"\n=== Running seed {seed} ===")
         seed_cfg = RunConfig(**{**asdict(cfg), "random_seed": int(seed), "seeds": None})
-        batch_rows.append(run_once(seed_cfg, batch_dir / f"seed_{int(seed)}"))
+        seed_run_dir = batch_dir / f"seed_{int(seed)}"
+        reuse_checkpoint_dir = None if int(seed) == first_seed else first_run_dir
+        batch_rows.append(run_once(seed_cfg, seed_run_dir, reuse_checkpoint_dir=reuse_checkpoint_dir))
     batch_timing = summarize_batch_timings(batch_rows)
     pd.DataFrame(batch_rows).to_csv(batch_dir / "batch_metrics_summary.csv", index=False)
     (batch_dir / "batch_config.json").write_text(
         json.dumps(
             {
-                "output_dir": str(cfg.output_dir),
+                "base_output_dir": str(cfg.output_dir),
+                "output_dir": str(output_dir),
                 "batch_dir": str(batch_dir),
+                "model_name": cfg.model_name,
                 "seeds": [int(seed) for seed in seed_values],
+                "checkpoint_seed": first_seed,
+                "reuse_first_seed_checkpoint": True,
                 "timing": batch_timing,
             },
             indent=2,

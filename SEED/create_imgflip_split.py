@@ -31,7 +31,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-images-per-template", type=int, default=None)
     parser.add_argument("--path-prefix-from", default=None)
     parser.add_argument("--path-prefix-to", default=None)
+    parser.add_argument(
+        "--exclude-templates",
+        default="meme_submissions",
+        help=(
+            "Comma-separated template folder names to exclude from the split. "
+            "Defaults to excluding the Reddit meme_submissions folder."
+        ),
+    )
     return parser.parse_args()
+
+
+def parse_excluded_templates(value: str | None) -> set[str]:
+    if not value:
+        return set()
+    return {template.strip() for template in value.split(",") if template.strip()}
 
 
 def main() -> None:
@@ -50,6 +64,16 @@ def main() -> None:
         max_templates=args.max_templates,
         max_images_per_template=args.max_images_per_template,
     )
+    excluded_templates = parse_excluded_templates(args.exclude_templates)
+    excluded_summary = {}
+    if excluded_templates:
+        excluded_mask = df["template"].isin(excluded_templates)
+        excluded_summary = {
+            "excluded_templates": sorted(excluded_templates),
+            "excluded_images": int(excluded_mask.sum()),
+        }
+        df = df[~excluded_mask].reset_index(drop=True)
+
     df = filter_valid_image_rows(df)
     df, filtering_summary = drop_small_classes(df, args.min_images_per_class)
     train_df, test_df = stratified_split(df, train_size=args.train_size, random_seed=args.random_seed)
@@ -70,6 +94,7 @@ def main() -> None:
             "classes_after_filtering": int(df["template"].nunique()),
             "train_images": int(len(train_df)),
             "test_images": int(len(test_df)),
+            "explicit_template_exclusions": excluded_summary,
             "small_class_filtering": filtering_summary,
         },
     }

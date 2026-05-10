@@ -15,11 +15,20 @@ from sklearn.cluster import AgglomerativeClustering, KMeans
 from sklearn.mixture import GaussianMixture
 from sklearn.preprocessing import StandardScaler
 
+import re
+from collections import Counter
+from itertools import combinations
+
+from scipy.spatial.distance import jensenshannon
+from scipy.stats import chi2_contingency, ks_2samp, kruskal, mannwhitneyu
+from sklearn.metrics import davies_bouldin_score, silhouette_score
+
 from common import (
     attach_template_assignments_from_parquet,
     build_current_data_bundle_raw,
     configure_plot_style,
     ensure_dir,
+    load_analysis_dataframe,
     prepare_analysis_dataframe,
     write_run_metadata,
     write_summary_markdown,
@@ -29,7 +38,10 @@ from q2_global_local_context import (
     LABEL_COLORS,
     NOTEBOOK_EMOTION_LABELS,
     NOTEBOOK_SENTIMENT_LABELS,
+    _rank_words_tfidf,
     add_affect_layers,
+    build_filtered_text,
+    build_word_frequencies,
     rank_words_for_wordclouds,
 )
 
@@ -124,14 +136,36 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--analysis-parquet", required=True)
     parser.add_argument("--results-dir", default="analysis/results/h1_analysis")
-    parser.add_argument("--min-posts", type=int, default=20)
+    parser.add_argument("--min-posts", type=int, default=10)
     parser.add_argument("--min-observed-days", type=int, default=180)
     parser.add_argument("--lifecycle-freq", default="M")
     parser.add_argument("--n-clusters", type=int, default=5)
     parser.add_argument(
         "--cluster-method",
-        choices=["kmeans", "hierarchical", "gmm"],
-        default="kmeans",
+        choices=["kmeans", "hierarchical", "gmm", "time_series_dtw", "time_series_kmeans"],
+        default="time_series_dtw",
+    )
+    parser.add_argument("--smooth-window", type=int, default=3)
+    parser.add_argument(
+        "--curve-normalization",
+        choices=["max", "total", "none"],
+        default="max",
+        help="Normalize each template lifecycle curve before time-series clustering.",
+    )
+    parser.add_argument(
+        "--robustness-k",
+        nargs="*",
+        type=int,
+        default=[4, 6],
+        help="Additional k values for time-series clustering robustness summaries.",
+    )
+    parser.add_argument(
+        "--manual-cluster-labels",
+        default="",
+        help=(
+            "Optional comma-separated cluster label mapping after centroid inspection, "
+            "for example '0=bursty,1=evergreen,2=emerging,3=faded,4=recurring'."
+        ),
     )
     parser.add_argument("--random-seed", type=int, default=42)
     parser.add_argument("--top-k-representatives", type=int, default=6)
@@ -192,6 +226,13 @@ def _safe_divide(a: float, b: float) -> float:
     if b == 0:
         return 0.0
     return float(a) / float(b)
+
+
+def _pick_first_existing_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    for column in candidates:
+        if column in df.columns:
+            return column
+    return None
 
 
 def build_template_lifecycle_features(
@@ -514,6 +555,320 @@ def select_representative_templates(
     return _set_category_order(representatives, "lifecycle_class")
 
 
+def _parse_manual_cluster_labels(raw: str) -> dict[int, str]:
+    mapping: dict[int, str] = {}
+    if not raw:
+        return mapping
+    for item in str(raw).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(
+                "--manual-cluster-labels entries must use cluster_id=label, "
+                f"got {item!r}."
+            )
+        left, right = item.split("=", 1)
+        label = right.strip().lower().replace(" ", "_")
+        if label not in DEFAULT_CLASS_ORDER:
+            raise ValueError(
+                f"Unsupported lifecycle label {label!r}; expected one of {DEFAULT_CLASS_ORDER}."
+            )
+        mapping[int(left.strip())] = label
+    return mapping
+
+
+def build_time_series_curve_matrix(
+    df: pd.DataFrame,
+    eligible: pd.DataFrame,
+    freq: str,
+    smooth_window: int,
+    normalization: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    pandas_freq = _normalize_pandas_freq(freq)
+    template_keys = eligible["template_key"].astype(str).tolist()
+    working = df[df["template_key"].astype(str).isin(template_keys)].copy()
+    if working.empty:
+        raise RuntimeError("No meme rows matched eligible lifecycle templates.")
+
+    dataset_start = _aligned_resample_endpoint(pd.Timestamp(df["created_utc"].min()), pandas_freq)
+    dataset_end = _aligned_resample_endpoint(pd.Timestamp(df["created_utc"].max()), pandas_freq)
+    full_periods = pd.date_range(dataset_start, dataset_end, freq=pandas_freq)
+    if full_periods.empty:
+        raise RuntimeError("Could not build a non-empty temporal index for lifecycle curves.")
+
+    period_alias = "M" if pandas_freq == "MS" else pandas_freq
+    counts = (
+        working.assign(period_start=working["created_utc"].dt.to_period(period_alias).dt.to_timestamp())
+        .groupby(["template_key", "period_start"], observed=True)
+        .size()
+        .rename("count")
+        .reset_index()
+        .pivot(index="template_key", columns="period_start", values="count")
+        .reindex(index=template_keys, columns=full_periods, fill_value=0)
+        .fillna(0.0)
+        .astype(float)
+    )
+
+    window = max(1, int(smooth_window))
+    smoothed = counts.T.rolling(window=window, min_periods=1).mean().T
+
+    if normalization == "max":
+        denom = smoothed.max(axis=1).replace(0.0, np.nan)
+        normalized = smoothed.div(denom, axis=0).fillna(0.0)
+    elif normalization == "total":
+        denom = smoothed.sum(axis=1).replace(0.0, np.nan)
+        normalized = smoothed.div(denom, axis=0).fillna(0.0)
+    elif normalization == "none":
+        normalized = smoothed.copy()
+    else:
+        raise ValueError(f"Unsupported curve normalization: {normalization}")
+
+    curve_long = (
+        counts.stack()
+        .rename("count")
+        .reset_index()
+        .rename(columns={"level_1": "period_start"})
+    )
+    smooth_long = (
+        smoothed.stack()
+        .rename("smooth")
+        .reset_index()
+        .rename(columns={"level_1": "period_start"})
+    )
+    norm_long = (
+        normalized.stack()
+        .rename("smooth_norm")
+        .reset_index()
+        .rename(columns={"level_1": "period_start"})
+    )
+    curve_long = curve_long.merge(smooth_long, on=["template_key", "period_start"], how="left")
+    curve_long = curve_long.merge(norm_long, on=["template_key", "period_start"], how="left")
+    curve_long["template_key"] = curve_long["template_key"].astype(str)
+    curve_long = curve_long.merge(
+        eligible.loc[:, ["template_key", "template_final"]],
+        on="template_key",
+        how="left",
+    )
+    return normalized, curve_long
+
+
+def _centroid_temporal_metrics(centroid: np.ndarray) -> dict[str, float]:
+    values = np.asarray(centroid, dtype=float)
+    values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0).clip(min=0.0)
+    n = int(len(values))
+    if n == 0:
+        return {}
+
+    total = float(values.sum())
+    peak_idx = int(np.argmax(values))
+    peak_value = float(values[peak_idx])
+    threshold = max(float(values.max()) * 0.05, 1e-9)
+    active_mask = values > threshold
+    active_values = values[active_mask]
+    sorted_values = np.sort(values)
+    probs = values / max(total, 1e-12)
+    nonzero_probs = probs[probs > 0]
+    entropy = float(-(nonzero_probs * np.log(nonzero_probs)).sum()) if len(nonzero_probs) else 0.0
+
+    active_run_count = 0
+    reactivation_count = 0
+    longest_zero_run = 0
+    current_zero_run = 0
+    in_active_run = False
+    has_seen_active_run = False
+    for is_active in active_mask:
+        if not is_active:
+            current_zero_run += 1
+            longest_zero_run = max(longest_zero_run, current_zero_run)
+            in_active_run = False
+            continue
+        current_zero_run = 0
+        if not in_active_run:
+            active_run_count += 1
+            if has_seen_active_run:
+                reactivation_count += 1
+            has_seen_active_run = True
+            in_active_run = True
+
+    after_peak = values[peak_idx + 1 :]
+    recent_window = min(3, n)
+    recent_share_3 = float(values[-recent_window:].sum() / max(total, 1e-12)) if recent_window else 0.0
+    previous_share_3 = (
+        float(values[-(2 * recent_window) : -recent_window].sum() / max(total, 1e-12))
+        if recent_window and n > recent_window else 0.0
+    )
+    peak_age_ratio = _safe_divide(n - peak_idx - 1, max(n - 1, 1))
+
+    return {
+        "active_ratio": _safe_divide(float(active_mask.sum()), n),
+        "entropy_norm": _safe_divide(entropy, math.log(n)) if n > 1 else 0.0,
+        "peak_share": float(peak_value / max(total, 1e-12)),
+        "top3_share": float(sorted_values[-3:].sum() / max(total, 1e-12)),
+        "pre_peak_share": float(values[:peak_idx].sum() / max(total, 1e-12)),
+        "post_peak_share": float(after_peak.sum() / max(total, 1e-12)),
+        "post_peak_active_ratio": _safe_divide(float((after_peak > threshold).sum()), len(after_peak)),
+        "half_ratio": _safe_divide(int(np.argmax(np.cumsum(values) >= total * 0.5)) + 1, n) if total > 0 else 0.0,
+        "peak_to_median_active_log": math.log1p(_safe_divide(peak_value, max(float(np.median(active_values)) if len(active_values) else 0.0, 1e-12))),
+        "active_run_density": _safe_divide(active_run_count, n),
+        "reactivation_ratio": _safe_divide(reactivation_count, max(active_run_count, 1)),
+        "longest_zero_ratio": _safe_divide(longest_zero_run, n),
+        "peak_age_ratio": peak_age_ratio,
+        "peak_recency_ratio": 1.0 - peak_age_ratio,
+        "recent_share_3": recent_share_3,
+        "recent_growth_log": math.log(((recent_share_3 * total) + 1.0) / ((previous_share_3 * total) + 1.0)),
+    }
+
+
+def _assign_cluster_names_from_centroids(
+    profile: pd.DataFrame,
+    manual_labels: dict[int, str],
+) -> dict[int, str]:
+    if manual_labels:
+        return {
+            int(cluster_id): manual_labels.get(int(cluster_id), f"cluster_{int(cluster_id)}")
+            for cluster_id in profile["lifecycle_cluster_id"].astype(int)
+        }
+    return _assign_cluster_names_from_scores(profile)
+
+
+def _fit_time_series_labels(
+    curves: pd.DataFrame,
+    n_clusters: int,
+    method: str,
+    random_seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    X = curves.to_numpy(dtype=float)
+    if method == "time_series_dtw":
+        try:
+            from tslearn.clustering import TimeSeriesKMeans
+        except ImportError as exc:
+            raise RuntimeError(
+                "time_series_dtw requires tslearn. Install it with `pip install tslearn` "
+                "or run with `--cluster-method time_series_kmeans`."
+            ) from exc
+        model = TimeSeriesKMeans(
+            n_clusters=int(n_clusters),
+            metric="dtw",
+            random_state=int(random_seed),
+            n_init=10,
+            verbose=False,
+        )
+        labels = model.fit_predict(X[:, :, None])
+        centroids = np.asarray(model.cluster_centers_, dtype=float).squeeze(axis=2)
+        return labels.astype(int), centroids
+
+    if method == "time_series_kmeans":
+        model = KMeans(n_clusters=int(n_clusters), random_state=int(random_seed), n_init=20)
+        labels = model.fit_predict(X)
+        centroids = np.asarray(model.cluster_centers_, dtype=float)
+        return labels.astype(int), centroids
+
+    raise ValueError(f"Unsupported time-series cluster method: {method}")
+
+
+def classify_template_lifecycles_time_series(
+    eligible: pd.DataFrame,
+    curves: pd.DataFrame,
+    n_clusters: int,
+    random_seed: int,
+    cluster_method: str,
+    manual_labels_raw: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    working = eligible.copy()
+    working["template_key"] = working["template_key"].astype(str)
+    curves = curves.reindex(working["template_key"].astype(str).tolist()).fillna(0.0)
+    n_clusters = max(1, min(int(n_clusters), len(working)))
+    labels, centroids = _fit_time_series_labels(
+        curves,
+        n_clusters=n_clusters,
+        method=cluster_method,
+        random_seed=random_seed,
+    )
+    working["lifecycle_cluster_id"] = labels
+
+    profile_rows: list[dict[str, Any]] = []
+    centroid_rows: list[dict[str, Any]] = []
+    periods = list(curves.columns)
+    for cluster_id in range(n_clusters):
+        centroid = np.asarray(centroids[cluster_id], dtype=float)
+        metrics = _centroid_temporal_metrics(centroid)
+        row = {
+            "lifecycle_cluster_id": int(cluster_id),
+            "templates_in_cluster": int((labels == cluster_id).sum()),
+            **metrics,
+        }
+        for label_name, weight_map in LIFECYCLE_SCORE_SPECS.items():
+            row[f"{label_name}_score"] = sum(
+                float(weight) * float(row.get(column, 0.0))
+                for column, weight in weight_map.items()
+            )
+        profile_rows.append(row)
+        for period, value in zip(periods, centroid):
+            centroid_rows.append(
+                {
+                    "lifecycle_cluster_id": int(cluster_id),
+                    "period_start": pd.Timestamp(period),
+                    "centroid_value": float(value),
+                }
+            )
+
+    profile = pd.DataFrame(profile_rows)
+    cluster_to_name = _assign_cluster_names_from_centroids(
+        profile,
+        manual_labels=_parse_manual_cluster_labels(manual_labels_raw),
+    )
+    working["lifecycle_class"] = working["lifecycle_cluster_id"].map(cluster_to_name).fillna("unassigned")
+    profile["lifecycle_class"] = profile["lifecycle_cluster_id"].map(cluster_to_name).fillna("unassigned")
+    centroids_long = pd.DataFrame(centroid_rows)
+    centroids_long["lifecycle_class"] = centroids_long["lifecycle_cluster_id"].map(cluster_to_name).fillna("unassigned")
+    return (
+        _set_category_order(working, "lifecycle_class"),
+        _set_category_order(profile, "lifecycle_class"),
+        _set_category_order(centroids_long, "lifecycle_class"),
+    )
+
+
+def select_time_series_representative_templates(
+    classified: pd.DataFrame,
+    curves: pd.DataFrame,
+    top_k: int,
+) -> pd.DataFrame:
+    working = classified.copy()
+    curves = curves.reindex(working["template_key"].astype(str).tolist()).fillna(0.0)
+    labels = working["lifecycle_cluster_id"].to_numpy(dtype=int)
+    centroids = pd.DataFrame(curves).groupby(labels).mean()
+
+    distances: list[float] = []
+    for template_key, cluster_id in zip(working["template_key"].astype(str), labels):
+        point = curves.loc[template_key].to_numpy(dtype=float)
+        center = centroids.loc[int(cluster_id)].to_numpy(dtype=float)
+        distances.append(float(np.linalg.norm(point - center)))
+
+    working["centroid_distance"] = distances
+    working["distance_rank"] = (
+        working.groupby("lifecycle_class", observed=True)["centroid_distance"]
+        .rank(method="dense", ascending=True)
+        .astype(float)
+    )
+    working["posts_rank"] = (
+        working.groupby("lifecycle_class", observed=True)["total_posts"]
+        .rank(method="dense", ascending=False)
+        .astype(float)
+    )
+    working["representative_score"] = working["distance_rank"] + (0.65 * working["posts_rank"])
+    representatives = (
+        working.sort_values(
+            ["lifecycle_class", "representative_score", "centroid_distance", "total_posts"],
+            ascending=[True, True, True, False],
+        )
+        .groupby("lifecycle_class", observed=True)
+        .head(int(top_k))
+        .reset_index(drop=True)
+    )
+    return _set_category_order(representatives, "lifecycle_class")
+
+
 def save_representative_lifecycle_plot(
     curve_df: pd.DataFrame,
     representatives: pd.DataFrame,
@@ -552,6 +907,38 @@ def save_representative_lifecycle_plot(
     ax.set_title(f"Representative {lifecycle_class.title()} Template Lifecycles")
     ax.set_xlabel("Time")
     ax.set_ylabel(ylabel)
+    ax.grid(alpha=0.25)
+    ax.legend(loc="upper left", fontsize=8, ncol=2)
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    fig.savefig(outpath, dpi=180)
+    plt.close(fig)
+
+
+def save_time_series_centroid_plot(
+    centroids_long: pd.DataFrame,
+    outpath: Path,
+    title: str,
+) -> None:
+    if centroids_long.empty:
+        return
+    configure_plot_style()
+    fig, ax = plt.subplots(figsize=(10.5, 6))
+    for lifecycle_class, subset in centroids_long.groupby("lifecycle_class", observed=True):
+        subset = subset.sort_values("period_start")
+        color = CLASS_COLORS.get(str(lifecycle_class), "#577590")
+        cluster_ids = sorted(subset["lifecycle_cluster_id"].astype(int).unique().tolist())
+        label = f"{str(lifecycle_class).title()} (cluster {cluster_ids[0]})" if cluster_ids else str(lifecycle_class)
+        ax.plot(
+            subset["period_start"],
+            subset["centroid_value"],
+            linewidth=2.6,
+            color=color,
+            label=label,
+        )
+    ax.set_title(title)
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Normalized Lifecycle Intensity")
     ax.grid(alpha=0.25)
     ax.legend(loc="upper left", fontsize=8, ncol=2)
     fig.autofmt_xdate()
@@ -1128,14 +1515,544 @@ def add_h1_affect_layers(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataF
     return add_derived_affect_metrics(add_affect_layers(df, affect_args))
 
 
+TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_'-]+")
+
+BASIC_STOPWORDS = {
+    "the", "and", "for", "that", "with", "this", "you", "your", "are", "was",
+    "were", "have", "has", "had", "but", "not", "from", "they", "them", "their",
+    "its", "it's", "just", "about", "into", "over", "than", "then", "what",
+    "when", "where", "which", "while", "who", "whom", "why", "how", "all",
+    "any", "can", "could", "should", "would", "may", "might", "also", "very",
+    "more", "most", "some", "such", "like", "one", "two", "three", "out",
+    "off", "our", "his", "her", "she", "him", "himself", "herself", "it",
+    "we", "us", "i", "me", "my", "mine", "on", "in", "to", "of", "at", "by",
+    "an", "a", "is", "be", "as", "or", "if", "so", "do", "did", "does"
+}
+
+
+def resolve_first_present_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    for column in candidates:
+        if column in df.columns:
+            return column
+    return None
+
+
+def add_bh_qvalues(df: pd.DataFrame, p_col: str = "p_value", q_col: str = "q_value") -> pd.DataFrame:
+    if df.empty or p_col not in df.columns:
+        return df
+    out = df.copy()
+    pvals = pd.to_numeric(out[p_col], errors="coerce").to_numpy(dtype=float)
+    qvals = np.full(len(out), np.nan, dtype=float)
+
+    valid = np.isfinite(pvals)
+    if valid.any():
+        p = pvals[valid]
+        m = len(p)
+        order = np.argsort(p)
+        ranked = p[order]
+        adjusted = ranked * m / (np.arange(1, m + 1))
+        adjusted = np.minimum.accumulate(adjusted[::-1])[::-1]
+        adjusted = np.clip(adjusted, 0.0, 1.0)
+
+        restored = np.empty_like(adjusted)
+        restored[order] = adjusted
+        qvals[np.where(valid)[0]] = restored
+
+    out[q_col] = qvals
+    return out
+
+
+def tokenize_text(text: Any, min_token_len: int = 3) -> list[str]:
+    if pd.isna(text):
+        return []
+    tokens = [tok.lower() for tok in TOKEN_RE.findall(str(text))]
+    tokens = [
+        tok for tok in tokens
+        if len(tok) >= int(min_token_len) and tok not in BASIC_STOPWORDS
+    ]
+    return tokens
+
+
+def compute_token_stats(tokens: list[str]) -> dict[str, float]:
+    if not tokens:
+        return {
+            "token_count": 0.0,
+            "unique_token_count": 0.0,
+            "ttr": 0.0,
+            "entropy_norm": 0.0,
+            "hhi": 0.0,
+            "top1_share": 0.0,
+        }
+
+    counter = Counter(tokens)
+    total = float(sum(counter.values()))
+    probs = np.asarray(list(counter.values()), dtype=float) / max(total, 1.0)
+
+    entropy = float(-(probs * np.log(probs)).sum()) if len(probs) else 0.0
+    entropy_norm = entropy / math.log(len(counter)) if len(counter) > 1 else 0.0
+
+    return {
+        "token_count": total,
+        "unique_token_count": float(len(counter)),
+        "ttr": float(len(counter)) / max(total, 1.0),
+        "entropy_norm": float(entropy_norm),
+        "hhi": float((probs ** 2).sum()) if len(probs) else 0.0,
+        "top1_share": float(probs.max()) if len(probs) else 0.0,
+    }
+
+
+def add_text_distribution_features(
+    df: pd.DataFrame,
+    text_col: str,
+    prefix: str,
+    min_token_len: int = 3,
+) -> pd.DataFrame:
+    out = df.copy()
+    stats_rows: list[dict[str, float]] = []
+
+    for text in out[text_col].fillna(""):
+        tokens = tokenize_text(text, min_token_len=min_token_len)
+        stats_rows.append(compute_token_stats(tokens))
+
+    stats_df = pd.DataFrame(stats_rows)
+    stats_df = stats_df.rename(columns={col: f"{prefix}_{col}" for col in stats_df.columns})
+    return pd.concat([out.reset_index(drop=True), stats_df.reset_index(drop=True)], axis=1)
+
+
+def compute_ranked_keywords_for_scope(
+    df: pd.DataFrame,
+    lifecycle_col: str,
+    text_col: str,
+    scope: str,
+    args: argparse.Namespace,
+) -> tuple[pd.DataFrame, str]:
+    keyword_input = df.loc[:, [lifecycle_col, text_col]].rename(
+        columns={lifecycle_col: "dominant_label", text_col: "source_text"}
+    )
+
+    if args.keyword_backend == "tfidf":
+        working = keyword_input.copy()
+        working["filtered_text"] = working["source_text"].fillna("").astype(str).map(
+            lambda text: build_filtered_text(text, min_token_len=args.keyword_min_token_len)
+        )
+        working = working[working["filtered_text"].str.strip().ne("")].copy()
+        if working.empty:
+            keyword_rows = pd.DataFrame(columns=["label", "word", "weight", "frequency"])
+            keyword_backend = "none"
+        else:
+            texts_by_label = (
+                working.groupby("dominant_label", observed=True)["filtered_text"].apply(list).to_dict()
+            )
+            freqs_by_label = {
+                label: build_word_frequencies(pd.Series(texts), min_token_len=args.keyword_min_token_len)
+                for label, texts in texts_by_label.items()
+            }
+            ranked, keyword_backend = _rank_words_tfidf(
+                texts_by_label=texts_by_label,
+                freqs_by_label=freqs_by_label,
+            )
+            rows: list[dict[str, Any]] = []
+            for label, scores in ranked.items():
+                for word, weight in sorted(scores.items(), key=lambda item: item[1], reverse=True):
+                    rows.append(
+                        {
+                            "label": label,
+                            "word": word,
+                            "weight": float(weight),
+                            "frequency": float(freqs_by_label.get(label, {}).get(word, 0.0)),
+                        }
+                    )
+            keyword_rows = pd.DataFrame(rows)
+    else:
+        _, keyword_rows, keyword_backend = rank_words_for_wordclouds(
+            dominant_df=keyword_input,
+            min_token_len=args.keyword_min_token_len,
+            embedding_model=args.keyword_embedding_model,
+            max_docs_per_class=args.keyword_max_docs_per_class,
+            random_seed=args.random_seed,
+        )
+
+    if keyword_rows.empty:
+        return pd.DataFrame(), keyword_backend
+
+    out = keyword_rows.copy()
+    if "label" in out.columns:
+        out = out.rename(columns={"label": "lifecycle_class"})
+    out["text_scope"] = scope
+
+    if "lifecycle_class" in out.columns:
+        out = (
+            out.sort_values(["lifecycle_class", "weight"], ascending=[True, False])
+            .groupby("lifecycle_class", observed=True)
+            .head(int(args.keyword_max_per_class))
+            .reset_index(drop=True)
+        )
+    return out, keyword_backend
+
+
+def build_class_token_profiles(
+    df: pd.DataFrame,
+    group_col: str,
+    text_col: str,
+    text_scope: str,
+    min_token_len: int = 3,
+    top_k: int = 25,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    grouped_counters: dict[str, Counter] = {}
+
+    for class_name, group in df.groupby(group_col, observed=True):
+        counter = Counter()
+        for text in group[text_col].fillna(""):
+            counter.update(tokenize_text(text, min_token_len=min_token_len))
+        if counter:
+            grouped_counters[str(class_name)] = counter
+
+    if not grouped_counters:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    token_rows: list[dict[str, Any]] = []
+    class_rows: list[dict[str, Any]] = []
+
+    for class_name, counter in grouped_counters.items():
+        total = float(sum(counter.values()))
+        probs = np.asarray(list(counter.values()), dtype=float) / max(total, 1.0)
+        entropy = float(-(probs * np.log(probs)).sum()) if len(probs) else 0.0
+        entropy_norm = entropy / math.log(len(counter)) if len(counter) > 1 else 0.0
+
+        class_rows.append(
+            {
+                "text_scope": text_scope,
+                "lifecycle_class": class_name,
+                "token_total": int(total),
+                "vocab_size": int(len(counter)),
+                "lexical_entropy_norm": float(entropy_norm),
+                "lexical_hhi": float((probs ** 2).sum()) if len(probs) else 0.0,
+                "lexical_top1_share": float(probs.max()) if len(probs) else 0.0,
+            }
+        )
+
+        for rank, (token, count) in enumerate(counter.most_common(), start=1):
+            token_rows.append(
+                {
+                    "text_scope": text_scope,
+                    "lifecycle_class": class_name,
+                    "token": token,
+                    "count": int(count),
+                    "proportion": float(count) / max(total, 1.0),
+                    "rank": int(rank),
+                    "is_top_k": bool(rank <= int(top_k)),
+                }
+            )
+
+    all_vocab = sorted(set().union(*[set(counter.keys()) for counter in grouped_counters.values()]))
+    pair_rows: list[dict[str, Any]] = []
+
+    for class_a, class_b in combinations(sorted(grouped_counters), 2):
+        counter_a = grouped_counters[class_a]
+        counter_b = grouped_counters[class_b]
+
+        vec_a = np.asarray([counter_a.get(tok, 0) for tok in all_vocab], dtype=float)
+        vec_b = np.asarray([counter_b.get(tok, 0) for tok in all_vocab], dtype=float)
+
+        vec_a = vec_a / max(vec_a.sum(), 1.0)
+        vec_b = vec_b / max(vec_b.sum(), 1.0)
+
+        top_a = {tok for tok, _ in counter_a.most_common(int(top_k))}
+        top_b = {tok for tok, _ in counter_b.most_common(int(top_k))}
+        union = top_a | top_b
+        inter = top_a & top_b
+
+        pair_rows.append(
+            {
+                "text_scope": text_scope,
+                "class_a": class_a,
+                "class_b": class_b,
+                "jsd": float(jensenshannon(vec_a, vec_b, base=2.0)),
+                "top_k_overlap_count": int(len(inter)),
+                "top_k_jaccard": float(len(inter)) / max(len(union), 1),
+                "shared_top_tokens": " | ".join(sorted(inter)),
+            }
+        )
+
+    return (
+        pd.DataFrame(token_rows),
+        pd.DataFrame(class_rows),
+        pd.DataFrame(pair_rows),
+    )
+
+
+def run_numeric_distribution_tests(
+    df: pd.DataFrame,
+    group_col: str,
+    metric_cols: list[str],
+    family: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    omnibus_rows: list[dict[str, Any]] = []
+    pairwise_rows: list[dict[str, Any]] = []
+
+    for metric in metric_cols:
+        if metric not in df.columns:
+            continue
+
+        working = df.loc[:, [group_col, metric]].copy()
+        working[metric] = pd.to_numeric(working[metric], errors="coerce")
+        working = working.dropna()
+
+        grouped = {
+            str(name): grp[metric].to_numpy(dtype=float)
+            for name, grp in working.groupby(group_col, observed=True)
+            if len(grp) > 0
+        }
+
+        if len(grouped) < 2:
+            continue
+
+        omnibus_groups = [vals for vals in grouped.values() if len(vals) >= 2]
+        if len(omnibus_groups) >= 2:
+            stat, p_value = kruskal(*omnibus_groups, nan_policy="omit")
+            omnibus_rows.append(
+                {
+                    "family": family,
+                    "feature": metric,
+                    "test": "kruskal",
+                    "statistic": float(stat),
+                    "p_value": float(p_value),
+                    "n_groups": int(len(omnibus_groups)),
+                    "n_total": int(sum(len(vals) for vals in grouped.values())),
+                }
+            )
+
+        for class_a, class_b in combinations(sorted(grouped), 2):
+            x = grouped[class_a]
+            y = grouped[class_b]
+            if len(x) == 0 or len(y) == 0:
+                continue
+
+            mw = mannwhitneyu(x, y, alternative="two-sided")
+            ks = ks_2samp(x, y, alternative="two-sided", method="auto")
+            rank_biserial = (2.0 * float(mw.statistic) / (len(x) * len(y))) - 1.0
+
+            pairwise_rows.append(
+                {
+                    "family": family,
+                    "feature": metric,
+                    "class_a": class_a,
+                    "class_b": class_b,
+                    "test": "mannwhitneyu",
+                    "statistic": float(mw.statistic),
+                    "p_value": float(mw.pvalue),
+                    "effect_size_rank_biserial": float(rank_biserial),
+                    "n_a": int(len(x)),
+                    "n_b": int(len(y)),
+                    "mean_a": float(np.mean(x)),
+                    "mean_b": float(np.mean(y)),
+                    "median_a": float(np.median(x)),
+                    "median_b": float(np.median(y)),
+                }
+            )
+            pairwise_rows.append(
+                {
+                    "family": family,
+                    "feature": metric,
+                    "class_a": class_a,
+                    "class_b": class_b,
+                    "test": "ks_2samp",
+                    "statistic": float(ks.statistic),
+                    "p_value": float(ks.pvalue),
+                    "effect_size_rank_biserial": np.nan,
+                    "n_a": int(len(x)),
+                    "n_b": int(len(y)),
+                    "mean_a": float(np.mean(x)),
+                    "mean_b": float(np.mean(y)),
+                    "median_a": float(np.median(x)),
+                    "median_b": float(np.median(y)),
+                }
+            )
+
+    return add_bh_qvalues(pd.DataFrame(omnibus_rows)), add_bh_qvalues(pd.DataFrame(pairwise_rows))
+
+
+def run_categorical_distribution_tests(
+    df: pd.DataFrame,
+    group_col: str,
+    categorical_cols: list[str],
+    family: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    test_rows: list[dict[str, Any]] = []
+    count_rows: list[pd.DataFrame] = []
+
+    for column in categorical_cols:
+        if column not in df.columns:
+            continue
+
+        working = df.loc[:, [group_col, column]].copy()
+        working[column] = working[column].astype("object").where(working[column].notna(), "unavailable").astype(str)
+        working[group_col] = working[group_col].astype(str)
+
+        contingency = pd.crosstab(working[group_col], working[column], dropna=False)
+        if contingency.shape[0] < 2 or contingency.shape[1] < 2:
+            continue
+
+        chi2, p_value, dof, expected = chi2_contingency(contingency)
+
+        test_rows.append(
+            {
+                "family": family,
+                "feature": column,
+                "test": "chi2_contingency",
+                "statistic": float(chi2),
+                "p_value": float(p_value),
+                "dof": int(dof),
+                "n_total": int(contingency.to_numpy().sum()),
+                "n_rows": int(contingency.shape[0]),
+                "n_cols": int(contingency.shape[1]),
+            }
+        )
+
+        counts_long = contingency.reset_index().melt(
+            id_vars=group_col,
+            var_name="category",
+            value_name="count",
+        )
+        counts_long["family"] = family
+        counts_long["feature"] = column
+        count_rows.append(counts_long)
+
+    counts_df = pd.concat(count_rows, ignore_index=True) if count_rows else pd.DataFrame()
+    return add_bh_qvalues(pd.DataFrame(test_rows)), counts_df
+
+
+def compute_cluster_validation_metrics(
+    classified: pd.DataFrame,
+    feature_cols: list[str],
+    cluster_method: str,
+) -> pd.DataFrame:
+    if classified.empty or not feature_cols:
+        return pd.DataFrame()
+
+    X = classified[feature_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    X = StandardScaler().fit_transform(X)
+    labels = classified["lifecycle_cluster_id"].to_numpy(dtype=int)
+
+    n_clusters = int(pd.Series(labels).nunique())
+    if n_clusters < 2 or len(labels) <= n_clusters:
+        return pd.DataFrame(
+            [{
+                "cluster_method": cluster_method,
+                "n_templates": int(len(classified)),
+                "n_clusters": n_clusters,
+                "silhouette_score": np.nan,
+                "davies_bouldin_score": np.nan,
+            }]
+        )
+
+    return pd.DataFrame(
+        [{
+            "cluster_method": cluster_method,
+            "n_templates": int(len(classified)),
+            "n_clusters": n_clusters,
+            "silhouette_score": float(silhouette_score(X, labels)),
+            "davies_bouldin_score": float(davies_bouldin_score(X, labels)),
+        }]
+    )
+
+
+def compute_cluster_validation_metrics_from_matrix(
+    matrix: pd.DataFrame,
+    classified: pd.DataFrame,
+    cluster_method: str,
+) -> pd.DataFrame:
+    if matrix.empty or classified.empty:
+        return pd.DataFrame()
+    ordered_keys = classified["template_key"].astype(str).tolist()
+    X = matrix.reindex(ordered_keys).fillna(0.0).to_numpy(dtype=float)
+    labels = classified["lifecycle_cluster_id"].to_numpy(dtype=int)
+    n_clusters = int(pd.Series(labels).nunique())
+    if n_clusters < 2 or len(labels) <= n_clusters:
+        return pd.DataFrame(
+            [{
+                "cluster_method": cluster_method,
+                "n_templates": int(len(classified)),
+                "n_clusters": n_clusters,
+                "silhouette_score": np.nan,
+                "davies_bouldin_score": np.nan,
+            }]
+        )
+    return pd.DataFrame(
+        [{
+            "cluster_method": cluster_method,
+            "n_templates": int(len(classified)),
+            "n_clusters": n_clusters,
+            "silhouette_score": float(silhouette_score(X, labels)),
+            "davies_bouldin_score": float(davies_bouldin_score(X, labels)),
+        }]
+    )
+
+
+def build_time_series_robustness_outputs(
+    eligible: pd.DataFrame,
+    curves: pd.DataFrame,
+    args: argparse.Namespace,
+    outdir: Path,
+) -> pd.DataFrame:
+    rows: list[pd.DataFrame] = []
+    candidate_ks = []
+    for k in [int(args.n_clusters), *[int(value) for value in args.robustness_k]]:
+        if k not in candidate_ks and k > 1:
+            candidate_ks.append(k)
+
+    for k in candidate_ks:
+        if k > len(eligible):
+            continue
+        classified_k, profile_k, centroids_k = classify_template_lifecycles_time_series(
+            eligible,
+            curves,
+            n_clusters=k,
+            random_seed=args.random_seed,
+            cluster_method=args.cluster_method,
+            manual_labels_raw="" if k != int(args.n_clusters) else args.manual_cluster_labels,
+        )
+        profile_k = profile_k.copy()
+        profile_k["k"] = int(k)
+        profile_k["cluster_method"] = str(args.cluster_method)
+        rows.append(profile_k)
+        save_time_series_centroid_plot(
+            centroids_k,
+            outpath=outdir / f"fig_time_series_cluster_centroids_k{k}.png",
+            title=f"Time-Series Lifecycle Cluster Centroids (k={k})",
+        )
+        classified_k.loc[:, ["template_key", "template_final", "lifecycle_cluster_id", "lifecycle_class"]].to_csv(
+            outdir / f"time_series_cluster_assignments_k{k}.csv",
+            index=False,
+        )
+
+    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+
 def run_analysis(args: argparse.Namespace) -> Path:
     outdir = ensure_dir(args.results_dir)
     data_dir = Path(args.analysis_parquet).expanduser().resolve().parent
     raw_df, bundle_metadata = build_current_data_bundle_raw(data_dir)
     raw_df, template_merge_metadata = attach_template_assignments_from_parquet(raw_df, args.analysis_parquet)
     df = prepare_template_dataframe(prepare_analysis_dataframe(raw_df))
+    if df.empty:
+        df = prepare_template_dataframe(load_analysis_dataframe(args.analysis_parquet))
+        bundle_metadata = {
+            **bundle_metadata,
+            "data_source_fallback": "analysis_parquet_direct",
+            "direct_analysis_parquet_rows": int(len(df)),
+        }
+        template_merge_metadata = {
+            "template_assignment_parquet": str(Path(args.analysis_parquet).expanduser().resolve()),
+            "template_assignment_overlap_rows": int(len(df)),
+            "template_assignment_base_coverage": 1.0,
+        }
     df, auto_topic_columns, topic_load_metadata = attach_topic_columns(df, args)
     lifecycle_metrics, lifecycle_curves = build_template_lifecycle_features(df, args.lifecycle_freq)
+    clustering_input_description = ""
+    cluster_validation = pd.DataFrame()
+    cluster_centroids_long = pd.DataFrame()
+    robustness_summary = pd.DataFrame()
 
     eligible = (
         lifecycle_metrics[
@@ -1148,17 +2065,63 @@ def run_analysis(args: argparse.Namespace) -> Path:
     if eligible.empty:
         raise RuntimeError("No templates passed the lifecycle eligibility filters.")
 
-    classified, cluster_profiles, feature_cols = classify_template_lifecycles(
-        eligible,
-        n_clusters=args.n_clusters,
-        random_seed=args.random_seed,
-        cluster_method=args.cluster_method,
-    )
-    representatives = select_representative_templates(
-        classified,
-        feature_cols=feature_cols,
-        top_k=args.top_k_representatives,
-    )
+    if str(args.cluster_method).startswith("time_series"):
+        curve_matrix, time_series_curves = build_time_series_curve_matrix(
+            df,
+            eligible,
+            freq=args.lifecycle_freq,
+            smooth_window=args.smooth_window,
+            normalization=args.curve_normalization,
+        )
+        classified, cluster_profiles, cluster_centroids_long = classify_template_lifecycles_time_series(
+            eligible,
+            curve_matrix,
+            n_clusters=args.n_clusters,
+            random_seed=args.random_seed,
+            cluster_method=args.cluster_method,
+            manual_labels_raw=args.manual_cluster_labels,
+        )
+        representatives = select_time_series_representative_templates(
+            classified,
+            curve_matrix,
+            top_k=args.top_k_representatives,
+        )
+        lifecycle_curves_for_plot = time_series_curves
+        feature_cols = [f"curve_{pd.Timestamp(col).strftime('%Y_%m_%d')}" for col in curve_matrix.columns]
+        cluster_validation = compute_cluster_validation_metrics_from_matrix(
+            curve_matrix,
+            classified,
+            cluster_method=args.cluster_method,
+        )
+        robustness_summary = build_time_series_robustness_outputs(
+            eligible,
+            curve_matrix,
+            args=args,
+            outdir=outdir,
+        )
+        clustering_input_description = (
+            f"normalized {args.lifecycle_freq} curves "
+            f"(smoothing window={int(args.smooth_window)}, normalization={args.curve_normalization})"
+        )
+    else:
+        classified, cluster_profiles, feature_cols = classify_template_lifecycles(
+            eligible,
+            n_clusters=args.n_clusters,
+            random_seed=args.random_seed,
+            cluster_method=args.cluster_method,
+        )
+        representatives = select_representative_templates(
+            classified,
+            feature_cols=feature_cols,
+            top_k=args.top_k_representatives,
+        )
+        lifecycle_curves_for_plot = lifecycle_curves
+        cluster_validation = compute_cluster_validation_metrics(
+            classified,
+            feature_cols=feature_cols,
+            cluster_method=args.cluster_method,
+        )
+        clustering_input_description = ", ".join(feature_cols)
 
     class_lookup = classified.set_index("template_key")["lifecycle_class"].to_dict()
     meme_level = df.copy()
@@ -1166,6 +2129,23 @@ def run_analysis(args: argparse.Namespace) -> Path:
     meme_level = meme_level[meme_level["lifecycle_class"].notna()].copy()
     meme_level = _set_category_order(meme_level, "lifecycle_class")
     meme_level = add_h1_affect_layers(meme_level, args)
+    local_text_col = resolve_first_present_column(
+        meme_level,
+        [
+            "local_text",
+            "local_context_text_meaning",
+            "local_context_user_texts_text",
+            "title",
+        ],
+    )
+    global_text_col = resolve_first_present_column(
+        meme_level,
+        [
+            "global_text",
+            "global_context_description",
+            "global_context_keywords_text",
+        ],
+    )
 
     template_counts = (
         classified.groupby("lifecycle_class", observed=True)
@@ -1200,24 +2180,65 @@ def run_analysis(args: argparse.Namespace) -> Path:
     affect_summary = compute_class_level_affect_summary(meme_level)
     template_affect_profiles = build_template_affect_profiles(meme_level)
 
-    keyword_input = meme_level.loc[:, ["lifecycle_class", "local_text"]].rename(
-        columns={"lifecycle_class": "dominant_label", "local_text": "source_text"}
-    )
-    keyword_weights, keyword_rows, keyword_backend = rank_words_for_wordclouds(
-        dominant_df=keyword_input,
-        min_token_len=args.keyword_min_token_len,
-        backend=args.keyword_backend,
-        embedding_model=args.keyword_embedding_model,
-        max_docs_per_class=args.keyword_max_docs_per_class,
-        random_seed=args.random_seed,
-    )
-    if not keyword_rows.empty:
-        keyword_rows = (
-            keyword_rows.sort_values(["label", "weight"], ascending=[True, False])
-            .groupby("label", observed=True)
-            .head(int(args.keyword_max_per_class))
-            .reset_index(drop=True)
+    # keyword_input = meme_level.loc[:, ["lifecycle_class", "local_text"]].rename(
+    #     columns={"lifecycle_class": "dominant_label", "local_text": "source_text"}
+    # )
+    # keyword_weights, keyword_rows, keyword_backend = rank_words_for_wordclouds(
+    #     dominant_df=keyword_input,
+    #     min_token_len=args.keyword_min_token_len,
+    #     embedding_model=args.keyword_embedding_model,
+    #     max_docs_per_class=args.keyword_max_docs_per_class,
+    #     random_seed=args.random_seed,
+    # )
+    # if not keyword_rows.empty:
+    #     keyword_rows = (
+    #         keyword_rows.sort_values(["label", "weight"], ascending=[True, False])
+    #         .groupby("label", observed=True)
+    #         .head(int(args.keyword_max_per_class))
+    #         .reset_index(drop=True)
+    #     )
+
+    keyword_backend = None
+    keyword_frames: list[pd.DataFrame] = []
+    lexical_summary_frames: list[pd.DataFrame] = []
+    lexical_pairwise_frames: list[pd.DataFrame] = []
+    lexical_token_frames: list[pd.DataFrame] = []
+
+    for scope, text_col in [("local", local_text_col), ("global", global_text_col)]:
+        if text_col is None:
+            continue
+
+        ranked_keywords, backend_used = compute_ranked_keywords_for_scope(
+            meme_level,
+            lifecycle_col="lifecycle_class",
+            text_col=text_col,
+            scope=scope,
+            args=args,
         )
+        if backend_used is not None:
+            keyword_backend = backend_used
+        if not ranked_keywords.empty:
+            keyword_frames.append(ranked_keywords)
+
+        token_rows, lexical_summary_scope, lexical_pairwise_scope = build_class_token_profiles(
+            meme_level,
+            group_col="lifecycle_class",
+            text_col=text_col,
+            text_scope=scope,
+            min_token_len=args.keyword_min_token_len,
+            top_k=args.keyword_max_per_class,
+        )
+        if not token_rows.empty:
+            lexical_token_frames.append(token_rows)
+        if not lexical_summary_scope.empty:
+            lexical_summary_frames.append(lexical_summary_scope)
+        if not lexical_pairwise_scope.empty:
+            lexical_pairwise_frames.append(lexical_pairwise_scope)
+
+    keyword_rows = pd.concat(keyword_frames, ignore_index=True) if keyword_frames else pd.DataFrame()
+    lexical_token_rows = pd.concat(lexical_token_frames, ignore_index=True) if lexical_token_frames else pd.DataFrame()
+    lexical_summary = pd.concat(lexical_summary_frames, ignore_index=True) if lexical_summary_frames else pd.DataFrame()
+    lexical_pairwise = pd.concat(lexical_pairwise_frames, ignore_index=True) if lexical_pairwise_frames else pd.DataFrame()
 
     requested_topic_columns = [str(col) for col in args.topic_columns]
     effective_topic_columns: list[str] = []
@@ -1230,11 +2251,167 @@ def run_analysis(args: argparse.Namespace) -> Path:
         if column not in effective_topic_columns and column in meme_level.columns:
             effective_topic_columns.append(column)
     topic_summary = summarize_topic_columns(meme_level, topic_columns=effective_topic_columns)
+    numeric_omnibus_frames: list[pd.DataFrame] = []
+    numeric_pairwise_frames: list[pd.DataFrame] = []
+    categorical_test_frames: list[pd.DataFrame] = []
+    categorical_count_frames: list[pd.DataFrame] = []
+
+    local_lexical_metrics = [
+        col for col in [
+            "local_token_count",
+            "local_unique_token_count",
+            "local_ttr",
+            "local_entropy_norm",
+            "local_hhi",
+            "local_top1_share",
+        ]
+        if col in meme_level.columns
+    ]
+    if local_lexical_metrics:
+        omnibus_df, pairwise_df = run_numeric_distribution_tests(
+            meme_level,
+            group_col="lifecycle_class",
+            metric_cols=local_lexical_metrics,
+            family="local_lexical",
+        )
+        if not omnibus_df.empty:
+            numeric_omnibus_frames.append(omnibus_df)
+        if not pairwise_df.empty:
+            numeric_pairwise_frames.append(pairwise_df)
+
+    global_lexical_metrics = [
+        col for col in [
+            "global_token_count",
+            "global_unique_token_count",
+            "global_ttr",
+            "global_entropy_norm",
+            "global_hhi",
+            "global_top1_share",
+        ]
+        if col in meme_level.columns
+    ]
+    if global_lexical_metrics:
+        omnibus_df, pairwise_df = run_numeric_distribution_tests(
+            meme_level,
+            group_col="lifecycle_class",
+            metric_cols=global_lexical_metrics,
+            family="global_lexical",
+        )
+        if not omnibus_df.empty:
+            numeric_omnibus_frames.append(omnibus_df)
+        if not pairwise_df.empty:
+            numeric_pairwise_frames.append(pairwise_df)
+
+    affect_metric_cols = [
+        col for col in [
+            "local_sentiment_score",
+            "global_sentiment_score",
+            "polarity_strength",
+            "ambivalence_index",
+            "emotion_intensity",
+            "emotion_entropy",
+            "positive_local",
+            "neutral_local",
+            "negative_local",
+            "joy_local",
+            "anger_local",
+            "fear_local",
+            "sadness_local",
+            "surprise_local",
+        ]
+        if col in meme_level.columns
+    ]
+    if affect_metric_cols:
+        omnibus_df, pairwise_df = run_numeric_distribution_tests(
+            meme_level,
+            group_col="lifecycle_class",
+            metric_cols=affect_metric_cols,
+            family="affect",
+        )
+        if not omnibus_df.empty:
+            numeric_omnibus_frames.append(omnibus_df)
+        if not pairwise_df.empty:
+            numeric_pairwise_frames.append(pairwise_df)
+
+    topic_probability_cols = [
+        col for col in ["local_topic_probability", "global_topic_probability"]
+        if col in meme_level.columns
+    ]
+    if topic_probability_cols:
+        omnibus_df, pairwise_df = run_numeric_distribution_tests(
+            meme_level,
+            group_col="lifecycle_class",
+            metric_cols=topic_probability_cols,
+            family="topic_probability",
+        )
+        if not omnibus_df.empty:
+            numeric_omnibus_frames.append(omnibus_df)
+        if not pairwise_df.empty:
+            numeric_pairwise_frames.append(pairwise_df)
+
+    affect_categorical_cols = [
+        col for col in [
+            "local_sentiment_label",
+            "global_sentiment_label",
+            "local_dominant_emotion",
+        ]
+        if col in meme_level.columns
+    ]
+    if affect_categorical_cols:
+        test_df, count_df = run_categorical_distribution_tests(
+            meme_level,
+            group_col="lifecycle_class",
+            categorical_cols=affect_categorical_cols,
+            family="affect_categorical",
+        )
+        if not test_df.empty:
+            categorical_test_frames.append(test_df)
+        if not count_df.empty:
+            categorical_count_frames.append(count_df)
+
+    topic_categorical_cols = [col for col in effective_topic_columns if col in meme_level.columns]
+    if topic_categorical_cols:
+        test_df, count_df = run_categorical_distribution_tests(
+            meme_level,
+            group_col="lifecycle_class",
+            categorical_cols=topic_categorical_cols,
+            family="topic_categorical",
+        )
+        if not test_df.empty:
+            categorical_test_frames.append(test_df)
+        if not count_df.empty:
+            categorical_count_frames.append(count_df)
+
+    h1_numeric_omnibus = (
+        pd.concat(numeric_omnibus_frames, ignore_index=True)
+        if numeric_omnibus_frames else pd.DataFrame()
+    )
+    h1_numeric_pairwise = (
+        pd.concat(numeric_pairwise_frames, ignore_index=True)
+        if numeric_pairwise_frames else pd.DataFrame()
+    )
+    h1_categorical_tests = (
+        pd.concat(categorical_test_frames, ignore_index=True)
+        if categorical_test_frames else pd.DataFrame()
+    )
+    h1_categorical_counts = (
+        pd.concat(categorical_count_frames, ignore_index=True)
+        if categorical_count_frames else pd.DataFrame()
+    )
 
     lifecycle_metrics.to_csv(outdir / "template_lifecycle_metrics_all.csv", index=False)
     classified.to_csv(outdir / "template_lifecycle_metrics_classified.csv", index=False)
     cluster_profiles.to_csv(outdir / "lifecycle_cluster_profiles.csv", index=False)
     representatives.to_csv(outdir / "representative_templates.csv", index=False)
+    if not cluster_centroids_long.empty:
+        cluster_centroids_long.to_csv(outdir / "time_series_cluster_centroids.csv", index=False)
+        save_time_series_centroid_plot(
+            cluster_centroids_long,
+            outpath=outdir / "fig_time_series_cluster_centroids.png",
+            title="Time-Series Lifecycle Cluster Centroids",
+        )
+    if not robustness_summary.empty:
+        robustness_summary.to_csv(outdir / "time_series_cluster_robustness.csv", index=False)
     meme_level.loc[:, ["key", "template_final", "template_key", "lifecycle_class"]].to_parquet(
         outdir / "meme_level_lifecycle_assignments.parquet",
         index=False,
@@ -1249,7 +2426,9 @@ def run_analysis(args: argparse.Namespace) -> Path:
         topic_summary.to_csv(outdir / "lifecycle_class_topic_summary.csv", index=False)
 
     representative_curve_keys = representatives["template_key"].tolist()
-    representative_curves = lifecycle_curves[lifecycle_curves["template_key"].isin(representative_curve_keys)].copy()
+    representative_curves = lifecycle_curves_for_plot[
+        lifecycle_curves_for_plot["template_key"].isin(representative_curve_keys)
+    ].copy()
     representative_curves.to_csv(outdir / "representative_template_lifecycle_curves.csv", index=False)
 
     for lifecycle_class in _ordered_classes(classified["lifecycle_class"]):
@@ -1283,6 +2462,89 @@ def run_analysis(args: argparse.Namespace) -> Path:
         outpath=outdir / "fig_lifecycle_class_meme_counts_by_sentiment.png",
         title="Memes per Lifecycle Class, Split by Local Sentiment",
     )
+
+    if not cluster_validation.empty:
+        cluster_validation.to_csv(outdir / "cluster_validation_metrics.csv", index=False)
+
+    if not keyword_rows.empty:
+        keyword_rows.to_csv(outdir / "lifecycle_class_keyword_weights_dual_scope.csv", index=False)
+        for scope in sorted(keyword_rows["text_scope"].astype(str).unique()):
+            subset = keyword_rows[keyword_rows["text_scope"].astype(str) == scope].copy()
+            subset.to_csv(outdir / f"lifecycle_class_keyword_weights_{scope}.csv", index=False)
+
+    if not lexical_token_rows.empty:
+        lexical_token_rows.to_csv(outdir / "lifecycle_class_token_distributions.csv", index=False)
+        for scope in sorted(lexical_token_rows["text_scope"].astype(str).unique()):
+            subset = lexical_token_rows[lexical_token_rows["text_scope"].astype(str) == scope].copy()
+            subset.to_csv(outdir / f"lifecycle_class_token_distributions_{scope}.csv", index=False)
+
+    if not lexical_summary.empty:
+        lexical_summary.to_csv(outdir / "lifecycle_class_lexical_summary.csv", index=False)
+        for scope in sorted(lexical_summary["text_scope"].astype(str).unique()):
+            subset = lexical_summary[lexical_summary["text_scope"].astype(str) == scope].copy()
+            subset.to_csv(outdir / f"lifecycle_class_lexical_summary_{scope}.csv", index=False)
+
+    if not lexical_pairwise.empty:
+        lexical_pairwise.to_csv(outdir / "lifecycle_class_pairwise_lexical_divergence.csv", index=False)
+        for scope in sorted(lexical_pairwise["text_scope"].astype(str).unique()):
+            subset = lexical_pairwise[lexical_pairwise["text_scope"].astype(str) == scope].copy()
+            subset.to_csv(outdir / f"lifecycle_class_pairwise_lexical_divergence_{scope}.csv", index=False)
+
+    if not h1_numeric_omnibus.empty:
+        h1_numeric_omnibus.to_csv(outdir / "h1_numeric_omnibus_tests.csv", index=False)
+
+    if not h1_numeric_pairwise.empty:
+        h1_numeric_pairwise.to_csv(outdir / "h1_numeric_pairwise_tests.csv", index=False)
+
+    if not h1_categorical_tests.empty:
+        h1_categorical_tests.to_csv(outdir / "h1_categorical_tests.csv", index=False)
+
+    if not h1_categorical_counts.empty:
+        h1_categorical_counts.to_csv(outdir / "h1_categorical_count_tables.csv", index=False)
+
+    h1_export_cols = [
+        "key",
+        "template_key",
+        "template_final",
+        "lifecycle_class",
+        "created_utc",
+        "score",
+        "num_comments",
+        local_text_col,
+        global_text_col,
+        "local_sentiment_label",
+        "global_sentiment_label",
+        "local_sentiment_score",
+        "global_sentiment_score",
+        "polarity_strength",
+        "ambivalence_index",
+        "emotion_intensity",
+        "emotion_entropy",
+        "local_dominant_emotion",
+        "local_topic",
+        "global_topic",
+        "local_topic_probability",
+        "global_topic_probability",
+        "local_token_count",
+        "local_unique_token_count",
+        "local_ttr",
+        "local_entropy_norm",
+        "local_hhi",
+        "local_top1_share",
+        "global_token_count",
+        "global_unique_token_count",
+        "global_ttr",
+        "global_entropy_norm",
+        "global_hhi",
+        "global_top1_share",
+    ]
+    h1_export_cols = [col for col in h1_export_cols if col is not None and col in meme_level.columns]
+
+    meme_level.loc[:, h1_export_cols].to_parquet(
+        outdir / "meme_level_h1_features.parquet",
+        index=False,
+    )
+
     if not sentiment_counts.empty:
         sentiment_counts.to_csv(outdir / "lifecycle_class_sentiment_counts.csv", index=False)
     emotion_counts = save_stacked_emotion_chart(
@@ -1340,7 +2602,7 @@ def run_analysis(args: argparse.Namespace) -> Path:
             f"{int(args.min_observed_days)} observed days online."
         ),
         (
-            f"Clustering: {args.cluster_method} with k={actual_cluster_count}, fit on {', '.join(feature_cols)}."
+            f"Clustering: {args.cluster_method} with k={actual_cluster_count}, fit on {clustering_input_description}."
         ),
         (
             "Lifecycle score formulas: evergreen rewards persistence and low concentration; recurring rewards "
@@ -1397,7 +2659,12 @@ def run_analysis(args: argparse.Namespace) -> Path:
             "clusters_fit": actual_cluster_count,
             "cluster_method": str(args.cluster_method),
             "cluster_feature_columns": feature_cols,
+            "clustering_input_description": clustering_input_description,
             "lifecycle_score_specs": LIFECYCLE_SCORE_SPECS,
+            "smooth_window": int(args.smooth_window),
+            "curve_normalization": str(args.curve_normalization),
+            "robustness_k": [int(value) for value in args.robustness_k],
+            "manual_cluster_labels": str(args.manual_cluster_labels),
             "random_seed": int(args.random_seed),
             "top_k_representatives": int(args.top_k_representatives),
             "emotion_backend": str(args.emotion_backend),
@@ -1411,6 +2678,14 @@ def run_analysis(args: argparse.Namespace) -> Path:
             **bundle_metadata,
             **template_merge_metadata,
             **topic_load_metadata,
+            "local_text_column_used": local_text_col,
+            "global_text_column_used": global_text_col,
+            "cluster_validation_available": bool(not cluster_validation.empty),
+            "numeric_omnibus_tests_rows": int(len(h1_numeric_omnibus)) if not h1_numeric_omnibus.empty else 0,
+            "numeric_pairwise_tests_rows": int(len(h1_numeric_pairwise)) if not h1_numeric_pairwise.empty else 0,
+            "categorical_tests_rows": int(len(h1_categorical_tests)) if not h1_categorical_tests.empty else 0,
+            "dual_scope_keyword_export": bool(not keyword_rows.empty),
+            "lexical_pairwise_export": bool(not lexical_pairwise.empty),
         },
     )
     print(f"results_dir={outdir}")

@@ -352,7 +352,49 @@ def select_best_threshold(targets: np.ndarray, probs: np.ndarray) -> tuple[float
     return float(thresholds[best_idx]), float(gmeans[best_idx])
 
 
-def run_once(cfg: RunConfig, run_dir: Path) -> dict[str, float | int | str]:
+def load_torch_state(path: Path) -> dict[str, torch.Tensor]:
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def validate_or_write_label_mapping(run_dir: Path, label_to_idx: dict[str, int], reuse_checkpoint_dir: Path | None) -> None:
+    mapping_path = run_dir / "label_to_idx.json"
+    if reuse_checkpoint_dir is not None:
+        source_mapping_path = reuse_checkpoint_dir / "label_to_idx.json"
+        if not source_mapping_path.exists():
+            raise FileNotFoundError(f"Missing label mapping for reused checkpoint: {source_mapping_path}")
+        source_mapping = json.loads(source_mapping_path.read_text())
+        if source_mapping != label_to_idx:
+            raise ValueError(
+                "Cannot reuse first-seed two-stage CNN checkpoint because the label mapping differs for this seed. "
+                "Use fixed train/test parquet files or keep the same filtered class set across seeds."
+            )
+    mapping_path.write_text(json.dumps(label_to_idx, indent=2))
+
+
+def load_binary_threshold(reuse_checkpoint_dir: Path) -> tuple[float, float | None]:
+    threshold_path = reuse_checkpoint_dir / "stage1_binary_threshold.json"
+    if threshold_path.exists():
+        threshold_info = json.loads(threshold_path.read_text())
+        return float(threshold_info["threshold"]), (
+            None if threshold_info.get("best_gmean") is None else float(threshold_info["best_gmean"])
+        )
+    run_config_path = reuse_checkpoint_dir / "run_config.json"
+    if not run_config_path.exists():
+        raise FileNotFoundError(f"Missing binary threshold metadata for reused checkpoint: {threshold_path}")
+    stage1_info = json.loads(run_config_path.read_text())["stage1_binary"]
+    return float(stage1_info["threshold"]), (
+        None if stage1_info.get("best_gmean") is None else float(stage1_info["best_gmean"])
+    )
+
+
+def run_once(
+    cfg: RunConfig,
+    run_dir: Path,
+    reuse_checkpoint_dir: Path | None = None,
+) -> dict[str, float | int | str]:
     set_seed(cfg.random_seed)
     run_started_at = now_iso()
     start_perf = time.perf_counter()
@@ -396,6 +438,7 @@ def run_once(cfg: RunConfig, run_dir: Path) -> dict[str, float | int | str]:
     labels = sorted(train_df["template"].unique().tolist())
     label_to_idx = {label: idx for idx, label in enumerate(labels)}
     idx_to_label = {idx: label for label, idx in label_to_idx.items()}
+    validate_or_write_label_mapping(run_dir, label_to_idx, reuse_checkpoint_dir)
 
     train_transform, eval_transform = build_transforms()
 
@@ -425,23 +468,35 @@ def run_once(cfg: RunConfig, run_dir: Path) -> dict[str, float | int | str]:
         lr=cfg.learning_rate,
         weight_decay=cfg.weight_decay,
     )
-    multi_state, multi_best_val_loss, multi_best_epoch, multi_history = train_model(
-        multi_model,
-        multi_train_loader,
-        multi_val_loader,
-        device,
-        multi_opt,
-        multi_loss,
-        cfg.epochs,
-        cfg.patience,
-        binary=False,
-    )
+    if reuse_checkpoint_dir is None:
+        multi_state, multi_best_val_loss, multi_best_epoch, multi_history = train_model(
+            multi_model,
+            multi_train_loader,
+            multi_val_loader,
+            device,
+            multi_opt,
+            multi_loss,
+            cfg.epochs,
+            cfg.patience,
+            binary=False,
+        )
+    else:
+        multi_checkpoint_path = reuse_checkpoint_dir / "stage2_multiclass_best.pt"
+        if not multi_checkpoint_path.exists():
+            raise FileNotFoundError(f"Cannot reuse missing multiclass CNN checkpoint: {multi_checkpoint_path}")
+        print(f"reusing_stage2_checkpoint={multi_checkpoint_path}")
+        multi_state = load_torch_state(multi_checkpoint_path)
+        multi_best_val_loss = float("nan")
+        multi_best_epoch = 0
+        multi_history = []
     multi_model.load_state_dict(multi_state)
     torch.save(multi_state, run_dir / "stage2_multiclass_best.pt")
 
     binary_stage_used = cfg.negative_root is not None
     binary_threshold = 0.0
     best_gmean = None
+    binary_best_val_loss: float | None = None
+    binary_best_epoch: int | None = None
     binary_history: list[dict[str, float]] = []
     if binary_stage_used:
         neg_df = collect_negative_rows(cfg.negative_root)
@@ -486,24 +541,50 @@ def run_once(cfg: RunConfig, run_dir: Path) -> dict[str, float | int | str]:
             lr=cfg.learning_rate,
             weight_decay=cfg.weight_decay,
         )
-        binary_state, binary_best_val_loss, binary_best_epoch, binary_history = train_model(
-            binary_model,
-            binary_train_loader,
-            binary_val_loader,
-            device,
-            binary_opt,
-            binary_loss,
-            cfg.epochs,
-            cfg.patience,
-            binary=True,
-        )
+        if reuse_checkpoint_dir is None:
+            binary_state, binary_best_val_loss, binary_best_epoch, binary_history = train_model(
+                binary_model,
+                binary_train_loader,
+                binary_val_loader,
+                device,
+                binary_opt,
+                binary_loss,
+                cfg.epochs,
+                cfg.patience,
+                binary=True,
+            )
+        else:
+            binary_checkpoint_path = reuse_checkpoint_dir / "stage1_binary_best.pt"
+            if not binary_checkpoint_path.exists():
+                raise FileNotFoundError(f"Cannot reuse missing binary CNN checkpoint: {binary_checkpoint_path}")
+            print(f"reusing_stage1_checkpoint={binary_checkpoint_path}")
+            binary_state = load_torch_state(binary_checkpoint_path)
+            binary_best_val_loss = float("nan")
+            binary_best_epoch = 0
+            binary_history = []
         binary_model.load_state_dict(binary_state)
         torch.save(binary_state, run_dir / "stage1_binary_best.pt")
-        _, binary_val_outputs = evaluate_binary(binary_model, binary_val_loader, device, binary_loss)
-        binary_threshold, best_gmean = select_best_threshold(
-            binary_val_outputs["targets"],
-            binary_val_outputs["probs"],
-        )
+        if reuse_checkpoint_dir is None:
+            _, binary_val_outputs = evaluate_binary(binary_model, binary_val_loader, device, binary_loss)
+            binary_threshold, best_gmean = select_best_threshold(
+                binary_val_outputs["targets"],
+                binary_val_outputs["probs"],
+            )
+            (run_dir / "stage1_binary_threshold.json").write_text(
+                json.dumps({"threshold": float(binary_threshold), "best_gmean": float(best_gmean)}, indent=2)
+            )
+        else:
+            binary_threshold, best_gmean = load_binary_threshold(reuse_checkpoint_dir)
+            (run_dir / "stage1_binary_threshold.json").write_text(
+                json.dumps(
+                    {
+                        "threshold": float(binary_threshold),
+                        "best_gmean": None if best_gmean is None else float(best_gmean),
+                        "source": str(reuse_checkpoint_dir / "stage1_binary_threshold.json"),
+                    },
+                    indent=2,
+                )
+            )
         _, binary_test_outputs = evaluate_binary(
             binary_model,
             make_loader(BinaryDataset(test_df.assign(binary_label=1.0), eval_transform), cfg.eval_batch_size, cfg.num_workers, False),
@@ -562,11 +643,17 @@ def run_once(cfg: RunConfig, run_dir: Path) -> dict[str, float | int | str]:
         },
         "stage1_binary": {
             "used": bool(binary_stage_used),
+            "reused_checkpoint": reuse_checkpoint_dir is not None and binary_stage_used,
+            "checkpoint_source": None if reuse_checkpoint_dir is None or not binary_stage_used else str(reuse_checkpoint_dir / "stage1_binary_best.pt"),
             "threshold": float(binary_threshold),
             "best_gmean": None if best_gmean is None else float(best_gmean),
+            "best_epoch": None if binary_best_epoch is None else int(binary_best_epoch),
+            "best_val_loss": None if binary_best_val_loss is None else float(binary_best_val_loss),
             "history": binary_history,
         },
         "stage2_multiclass": {
+            "reused_checkpoint": reuse_checkpoint_dir is not None,
+            "checkpoint_source": None if reuse_checkpoint_dir is None else str(reuse_checkpoint_dir / "stage2_multiclass_best.pt"),
             "best_epoch": int(multi_best_epoch),
             "best_val_loss": float(multi_best_val_loss),
             "history": multi_history,
@@ -577,6 +664,7 @@ def run_once(cfg: RunConfig, run_dir: Path) -> dict[str, float | int | str]:
         "run_dir": str(run_dir),
         "seed": int(cfg.random_seed),
         "binary_stage_used": bool(binary_stage_used),
+        "reused_checkpoint": reuse_checkpoint_dir is not None,
         "accuracy": float(metrics["accuracy"]),
         "precision": float(metrics["precision"]),
         "recall": float(metrics["recall"]),
@@ -613,10 +701,14 @@ def main() -> None:
     batch_dir = cfg.output_dir / f"{timestamp}_batch"
     batch_dir.mkdir(parents=True, exist_ok=True)
     batch_rows: list[dict[str, float | int | str]] = []
+    first_seed = int(seed_values[0])
+    first_run_dir = batch_dir / f"seed_{first_seed}"
     for seed in seed_values:
         print(f"\n=== Running seed {seed} ===")
         seed_cfg = RunConfig(**{**asdict(cfg), "random_seed": int(seed), "seeds": None})
-        batch_rows.append(run_once(seed_cfg, batch_dir / f"seed_{int(seed)}"))
+        seed_run_dir = batch_dir / f"seed_{int(seed)}"
+        reuse_checkpoint_dir = None if int(seed) == first_seed else first_run_dir
+        batch_rows.append(run_once(seed_cfg, seed_run_dir, reuse_checkpoint_dir=reuse_checkpoint_dir))
     batch_timing = summarize_batch_timings(batch_rows)
     pd.DataFrame(batch_rows).to_csv(batch_dir / "batch_metrics_summary.csv", index=False)
     (batch_dir / "batch_config.json").write_text(
@@ -625,6 +717,8 @@ def main() -> None:
                 "output_dir": str(cfg.output_dir),
                 "batch_dir": str(batch_dir),
                 "seeds": [int(seed) for seed in seed_values],
+                "checkpoint_seed": first_seed,
+                "reuse_first_seed_checkpoint": True,
                 "timing": batch_timing,
             },
             indent=2,

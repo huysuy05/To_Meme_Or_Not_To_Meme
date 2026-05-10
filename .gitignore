@@ -33,3 +33,6 @@ EDA_local.ipynb
 analysis/cache/q2_cardiff_affect
 meme_modeling.ipynb
 final_report.tex
+sentimentEmotion.ipynb
+.env
+current_progress/
